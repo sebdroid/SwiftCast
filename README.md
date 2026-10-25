@@ -88,7 +88,7 @@ Local network access has to be declared, or discovery and connections fail silen
 ```
 
 Apps that later browse by receiver app id must also list `_<appId>._googlecast._tcp` in
-`NSBonjourServices` (the iOS Cast SDK requires both entries).
+`NSBonjourServices` (Google's iOS sender setup guide lists both entries).
 
 ### Entitlements (macOS)
 
