@@ -77,10 +77,11 @@ struct ModelTests {
     }
 
     @Test func parsesDeviceTXTRecord() throws {
-        let device = try #require(CastDevice(
+        let parsedDevice = CastDevice(
             serviceEndpoint: .service(name: "Chromecast-abc", type: "_googlecast._tcp", domain: "local.", interface: nil),
             txt: ["id": "abc123", "fn": "Living Room", "md": "Chromecast Ultra", "ca": "201221", "rs": "YouTube"]
-        ))
+        )
+        let device = try #require(parsedDevice)
         #expect(device.id == "abc123")
         #expect(device.name == "Living Room")
         #expect(device.modelName == "Chromecast Ultra")
@@ -88,10 +89,11 @@ struct ModelTests {
         #expect(!device.isGroup)
         #expect(device.statusText == "YouTube")
 
-        let group = try #require(CastDevice(
+        let parsedGroup = CastDevice(
             serviceEndpoint: .service(name: "Google-Cast-Group-1", type: "_googlecast._tcp", domain: "local.", interface: nil),
             txt: ["ca": "2084", "fn": ""]
-        ))
+        )
+        let group = try #require(parsedGroup)
         #expect(group.id == "Google-Cast-Group-1")
         #expect(group.name == "Google-Cast-Group-1")
         #expect(group.isGroup)
