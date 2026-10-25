@@ -108,7 +108,6 @@ struct WireFuzzTests {
         for _ in 0..<3000 {
             var fields: [String] = []
             if Bool.random(using: &generator) { fields.append(#""requestId":"# + Self.randomNumber(using: &generator)) }
-            if Bool.random(using: &generator) { fields.append(#""launchRequestId":"# + Self.randomValue(depth: 1, using: &generator)) }
             if Bool.random(using: &generator) { fields.append(#""type":"# + Self.randomValue(depth: 1, using: &generator)) }
             for index in 0..<Int.random(in: 0..<4, using: &generator) {
                 fields.append("\"f\(index)\":" + Self.randomValue(depth: 3, using: &generator))

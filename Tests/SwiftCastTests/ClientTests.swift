@@ -181,7 +181,7 @@ struct ClientTests {
         let updates = await client.receiverStatusUpdates()
         let payload = #"{"requestId":9223372036854775808,"type":"RECEIVER_STATUS","status":{"volume":{"level":0.75,"muted":false}}}"#
         let message = CastMessage(sourceID: CastEndpoint.platformReceiver, destinationID: "*", namespace: CastNamespace.receiver.rawValue, payload: .string(payload))
-        mock.pushRaw(FrameCodec.frame(message))
+        mock.pushRaw(try FrameCodec.frame(message))
         for await status in updates {
             #expect(status.volume?.level == 0.75)
             break
@@ -189,20 +189,6 @@ struct ClientTests {
         #expect(await client.state == .connected)
         let status = try await client.receiver.getStatus()
         #expect(status.volume?.level == 0.5)
-    }
-
-    @Test func launchRequestIDResolvesRequest() async throws {
-        let mock = MockReceiver()
-        mock.on("LAUNCH") { request, mock in
-            var status = Fixtures.receiverStatus(apps: [Fixtures.mediaApp]).objectValue ?? [:]
-            if let id = request.requestID { status["launchRequestId"] = .number(Double(id)) }
-            mock.push(.object(status), namespace: .receiver, to: "*")
-        }
-        let client = makeClient(mock)
-        try await client.connect()
-        let reply = try await client.request(["type": "LAUNCH", "appId": "CC1AD845"] as JSONValue, namespace: .receiver, to: "receiver-0", timeout: .seconds(2))
-        #expect(reply.type == "RECEIVER_STATUS")
-        #expect(reply.json?["requestId"] == nil)
     }
 
     @Test func mapsStandardErrorResponses() async throws {

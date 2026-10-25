@@ -23,15 +23,10 @@ public struct InboundMessage: Sendable, Hashable {
     /// The `type` field of the JSON payload, e.g. `RECEIVER_STATUS`.
     public var type: String? { json?["type"]?.stringValue }
 
-    /// The `requestId` the message responds to, falling back to `launchRequestId`;
-    /// `0` or `nil` for unsolicited messages. Only 32-bit integers are accepted.
+    /// The `requestId` the message responds to; `0` or `nil` for unsolicited messages.
+    /// Only 32-bit integers are accepted.
     public var requestID: Int? {
-        guard let json else { return nil }
-        return Self.int32(json["requestId"]) ?? Self.int32(json["launchRequestId"])
-    }
-
-    private static func int32(_ value: JSONValue?) -> Int? {
-        guard let number = value?.doubleValue, let id = Int32(exactly: number) else { return nil }
+        guard let number = json?["requestId"]?.doubleValue, let id = Int32(exactly: number) else { return nil }
         return Int(id)
     }
 

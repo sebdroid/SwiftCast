@@ -113,15 +113,6 @@ struct ModelTests {
         #expect(inbound(#"{"requestId":0}"#).requestID == 0)
     }
 
-    @Test func requestIDFallsBackToLaunchRequestID() {
-        #expect(inbound(#"{"type":"RECEIVER_STATUS","launchRequestId":12}"#).requestID == 12)
-        #expect(inbound(#"{"requestId":3,"launchRequestId":12}"#).requestID == 3)
-        #expect(inbound(#"{"requestId":0,"launchRequestId":12}"#).requestID == 0)
-        #expect(inbound(#"{"requestId":2147483648,"launchRequestId":12}"#).requestID == 12)
-        #expect(inbound(#"{"requestId":null,"launchRequestId":12}"#).requestID == 12)
-        #expect(inbound(#"{"launchRequestId":2147483648}"#).requestID == nil)
-    }
-
     @Test func requestIDMissingIsNil() {
         #expect(inbound(#"{"type":"RECEIVER_STATUS"}"#).requestID == nil)
         #expect(inbound(#"[1,2,3]"#).requestID == nil)
