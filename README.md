@@ -1,7 +1,7 @@
 # SwiftCast
 
 [![CI](https://github.com/CreatureSurvive/SwiftCast/actions/workflows/ci.yml/badge.svg)](https://github.com/CreatureSurvive/SwiftCast/actions/workflows/ci.yml)
-[![Swift 6.1+](https://img.shields.io/badge/Swift-6.1+-F05138?logo=swift&logoColor=white)](https://swift.org)
+[![Swift 6.0+](https://img.shields.io/badge/Swift-6.0+-F05138?logo=swift&logoColor=white)](https://swift.org)
 [![Platforms](https://img.shields.io/badge/platforms-iOS%20%7C%20macOS%20%7C%20tvOS%20%7C%20visionOS-blue)](#requirements)
 [![Swift Package Manager](https://img.shields.io/badge/SwiftPM-compatible-brightgreen)](#installation)
 [![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
@@ -72,11 +72,18 @@ Or in Xcode, choose **File › Add Package Dependencies…** and enter
 | tvOS | 17.0 |
 | visionOS | 1.0 |
 
-Swift 6.1 (Xcode 16.4) or later, in Swift 6 language mode. No third-party dependencies.
+The package manifest requires Swift 6.0 or later and builds in Swift 6 language mode. CI tests
+Swift 6.1 (Xcode 16.4) and Xcode 26. No third-party dependencies.
 
-### Info.plist (iOS, tvOS, visionOS)
+### Local network privacy (iOS, iPadOS, macOS, visionOS)
 
-Local network access has to be declared, or discovery and connections fail silently:
+[Local network privacy](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)
+applies on iOS and iPadOS 14, macOS 15 and visionOS 1 or later. Both Bonjour discovery and the
+outgoing TCP connection to a device count as local network operations, so the system asks the user
+for access the first time either happens. Add a
+[`NSLocalNetworkUsageDescription`](https://developer.apple.com/documentation/bundleresources/information-property-list/nslocalnetworkusagedescription)
+to explain why, and list the Cast service type in
+[`NSBonjourServices`](https://developer.apple.com/documentation/bundleresources/information-property-list/nsbonjourservices):
 
 ```xml
 <key>NSLocalNetworkUsageDescription</key>
@@ -87,13 +94,15 @@ Local network access has to be declared, or discovery and connections fail silen
 </array>
 ```
 
-Apps that later browse by receiver app id must also list `_<appId>._googlecast._tcp` in
-`NSBonjourServices` (Google's iOS sender setup guide lists both entries).
+tvOS doesn't have local network privacy, so the keys aren't required there. On macOS,
+command-line tools run from Terminal, such as `castctl`, are allowed local network access
+automatically.
 
 ### Entitlements (macOS)
 
-Sandboxed macOS apps need the `com.apple.security.network.client` entitlement, both for Bonjour
-browsing and for the port 8009 connection.
+Sandboxed macOS apps need the
+[`com.apple.security.network.client`](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.network.client)
+entitlement, which allows outgoing network connections such as the one to port 8009.
 
 ## Usage
 
