@@ -10,7 +10,7 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
     case heartbeatTimeout
     /// A request did not receive a response in time.
     case timeout
-    /// Bytes received from the device could not be decoded.
+    /// A message could not be framed for sending or decoded after receipt.
     case malformedMessage(String)
     /// An outbound message body of the given byte count exceeds the Cast frame limit.
     case messageTooLarge(Int)
