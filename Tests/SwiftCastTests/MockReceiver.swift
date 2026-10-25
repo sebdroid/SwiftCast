@@ -48,8 +48,8 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
     }
 
     func send(_ data: Data) async throws {
-        let messages = try state.withLock { try $0.decoder.append(data) }
-        for message in messages {
+        let output = state.withLock { $0.decoder.append(data) }
+        for message in output.messages {
             let inbound = InboundMessage(message)
             let handler = state.withLock { state -> Handler? in
                 state.sent.append(inbound)
@@ -60,6 +60,7 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
             }
             handler?(inbound, self)
         }
+        if let error = output.error { throw error }
     }
 
     func close() {
@@ -73,7 +74,7 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
     func push(_ json: JSONValue, namespace: CastNamespace, from source: String = CastEndpoint.platformReceiver, to destination: String = "sender-0") {
         let data = try! JSONEncoder().encode(json)
         let message = CastMessage(sourceID: source, destinationID: destination, namespace: namespace.rawValue, payload: .string(String(decoding: data, as: UTF8.self)))
-        continuation.yield(FrameCodec.frame(message))
+        continuation.yield(try! FrameCodec.frame(message))
     }
 
     /// Replies to a request, echoing its `requestId`.

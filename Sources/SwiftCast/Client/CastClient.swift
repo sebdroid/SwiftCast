@@ -375,16 +375,13 @@ public actor CastClient {
     private func ingest(_ chunk: Data, generation: Int) {
         guard generation == self.generation else { return }
         lastInbound = .now
-        let messages: [CastMessage]
-        do {
-            messages = try decoder.append(chunk)
-        } catch {
-            teardown(error: (error as? CastError) ?? .malformedMessage("\(error)"), generation: generation)
-            return
-        }
-        for message in messages {
+        let output = decoder.append(chunk)
+        for message in output.messages {
             handle(InboundMessage(message))
             guard generation == self.generation else { return }
+        }
+        if let error = output.error {
+            teardown(error: error, generation: generation)
         }
     }
 
