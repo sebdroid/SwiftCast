@@ -25,14 +25,18 @@ func usage() -> Never {
     exit(64)
 }
 
+func sanitized(_ text: String) -> String {
+    String(String.UnicodeScalarView(text.unicodeScalars.filter { $0 == " " || !CharacterSet.controlCharacters.contains($0) }))
+}
+
 func describe(_ status: ReceiverStatus) {
     if let volume = status.volume {
         print("volume: \(volume.level.map { String(format: "%.2f", $0) } ?? "?") muted: \(volume.muted ?? false)")
     }
     if status.isStandBy == true { print("standby: true") }
     for app in status.applications ?? [] {
-        print("app: \(app.displayName ?? app.appId.rawValue) [\(app.appId)] session=\(app.sessionId)\(app.isIdleScreen == true ? " (idle screen)" : "")")
-        if let text = app.statusText, !text.isEmpty { print("  status: \(text)") }
+        print("app: \(sanitized(app.displayName ?? app.appId.rawValue)) [\(sanitized(app.appId.rawValue))] session=\(sanitized(app.sessionId))\(app.isIdleScreen == true ? " (idle screen)" : "")")
+        if let text = app.statusText, !text.isEmpty { print("  status: \(sanitized(text))") }
     }
 }
 
@@ -41,7 +45,7 @@ func describe(_ status: MediaStatus?) {
     let time = status.currentTime.map { String(format: "%.1fs", $0) } ?? "?"
     let duration = status.media?.duration.map { String(format: "%.1fs", $0) } ?? "?"
     let reason = status.idleReason.map { " (\($0.rawValue))" } ?? ""
-    print("media: \(status.media?.metadata?.title ?? status.media?.contentId ?? "unknown") \(status.playerState.rawValue)\(reason) \(time)/\(duration)")
+    print("media: \(sanitized(status.media?.metadata?.title ?? status.media?.contentId ?? "unknown")) \(status.playerState.rawValue)\(reason) \(time)/\(duration)")
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
@@ -51,7 +55,7 @@ if command == "scan" {
     let devices = await CastDiscovery.scan(for: .seconds(3))
     if devices.isEmpty { print("No Cast devices found.") }
     for device in devices {
-        print("\(device.name)\t\(device.modelName ?? "-")\tid=\(device.id)\tcaps=\(device.capabilities.rawValue)")
+        print("\(sanitized(device.name))\t\(sanitized(device.modelName ?? "-"))\tid=\(sanitized(device.id))\tcaps=\(device.capabilities.rawValue)")
     }
     exit(0)
 }
@@ -100,7 +104,7 @@ do {
         let seconds = arguments.count >= 3 ? Double(arguments[2]) ?? 30 : 30
         describe(try await client.receiver.getStatus())
         let availability = try await client.receiver.availability(of: [.defaultMediaReceiver, .youTube, .jellyfin])
-        for (app, state) in availability.sorted(by: { $0.key.rawValue < $1.key.rawValue }) { print("availability \(app): \(state.rawValue)") }
+        for (app, state) in availability.sorted(by: { $0.key.rawValue < $1.key.rawValue }) { print("availability \(sanitized(app.rawValue)): \(state.rawValue)") }
         let states = await client.stateUpdates()
         let watcher = Task {
             for await status in await client.receiverStatusUpdates() { describe(status) }
@@ -119,7 +123,7 @@ do {
         let status = try await client.receiver.getStatus()
         if let app = status.foregroundApplication {
             try await client.receiver.stop(app)
-            print("Stopped \(app.displayName ?? app.appId.rawValue).")
+            print("Stopped \(sanitized(app.displayName ?? app.appId.rawValue)).")
         }
     default:
         usage()

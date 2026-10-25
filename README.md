@@ -87,6 +87,14 @@ Local network access has to be declared, or discovery and connections fail silen
 </array>
 ```
 
+Apps that later browse by receiver app id must also list `_<appId>._googlecast._tcp` in
+`NSBonjourServices` (the iOS Cast SDK requires both entries).
+
+### Entitlements (macOS)
+
+Sandboxed macOS apps need the `com.apple.security.network.client` entitlement, both for Bonjour
+browsing and for the port 8009 connection.
+
 ## Usage
 
 ### Discovery
@@ -226,7 +234,7 @@ continues.
 - SwiftCast is a sender, not a receiver.
 - It doesn't do screen mirroring or Cast Connect (Android TV receiver handoff credentials beyond
   `credentials` in `LOAD`).
-- It doesn't perform device authentication, which is optional for senders. Certificates are not
+- It doesn't perform device authentication yet, so peers are unauthenticated. Certificates are not
   validated because Cast devices present self-signed certificates.
 
 ## Changelog
