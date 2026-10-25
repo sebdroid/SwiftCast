@@ -198,14 +198,23 @@ struct MediaControllerTests {
         #expect(await media.status?.playerState == .buffering)
     }
 
-    @Test func stopClearsSession() async throws {
-        for reply in [["type": "MEDIA_STATUS", "status": []], Fixtures.mediaStatus(sessionID: 1, state: "IDLE", includeMedia: false)] as [JSONValue] {
-            let (media, mock) = try await loadedMedia()
-            mock.on("STOP") { request, mock in mock.reply(to: request, reply) }
-            let stopped = try await media.stop()
-            #expect(stopped == nil)
-            #expect(await media.status == nil)
+    @Test func stopAppliesIdleStatus() async throws {
+        let (media, mock) = try await loadedMedia()
+        mock.on("STOP") { request, mock in
+            mock.reply(to: request, Fixtures.mediaStatus(sessionID: 1, state: "IDLE", includeMedia: false))
         }
+        let stopped = try #require(try await media.stop())
+        #expect(stopped.playerState == .idle)
+        #expect(stopped.media?.duration == 596.5)
+        #expect(await media.status == stopped)
+    }
+
+    @Test func stopWithEmptyStatusYieldsNil() async throws {
+        let (media, mock) = try await loadedMedia()
+        mock.on("STOP") { request, mock in mock.reply(to: request, ["type": "MEDIA_STATUS", "status": []]) }
+        let stopped = try await media.stop()
+        #expect(stopped == nil)
+        #expect(await media.status == nil)
     }
 
     @Test func emptyStatusListMeansNoSession() async throws {
@@ -240,16 +249,17 @@ struct MediaControllerTests {
         #expect(await media.status?.media?.duration == 596.5)
     }
 
-    @Test func prefersStatusEntryForCurrentSession() async throws {
+    @Test func usesFirstStatusEntry() async throws {
         let (media, mock) = try await loadedMedia()
         mock.on("PLAY") { request, mock in
-            let other = Fixtures.mediaStatus(sessionID: 2, state: "IDLE")["status"]?.arrayValue ?? []
-            let current = Fixtures.mediaStatus(sessionID: 1, state: "PLAYING", includeMedia: false)["status"]?.arrayValue ?? []
-            mock.reply(to: request, ["type": "MEDIA_STATUS", "status": .array(other + current)])
+            let first = Fixtures.mediaStatus(sessionID: 2, state: "PLAYING")["status"]?.arrayValue ?? []
+            let second = Fixtures.mediaStatus(sessionID: 1, state: "PAUSED", includeMedia: false)["status"]?.arrayValue ?? []
+            mock.reply(to: request, ["type": "MEDIA_STATUS", "status": .array(first + second)])
         }
         let status = try #require(try await media.play())
-        #expect(status.mediaSessionId == 1)
+        #expect(status.mediaSessionId == 2)
         #expect(status.playerState == .playing)
+        #expect(await media.status?.mediaSessionId == 2)
     }
 
     @Test func errorReasonsDecodeOpenly() throws {

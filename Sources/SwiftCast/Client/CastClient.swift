@@ -229,7 +229,7 @@ public actor CastClient {
     ) async throws -> InboundMessage {
         guard state == .connected || state == .connecting else { throw CastError.notConnected }
         guard case .object(var object) = try JSONValue(encoding: payload) else {
-            throw CastError.invalidRequest(MediaErrorInfo(type: "INVALID_REQUEST", reason: .invalidParams))
+            throw CastError.invalidPayload("Request payload must be a JSON object")
         }
         let requestID = nextRequestID
         nextRequestID = nextRequestID == Int32.max ? 1 : nextRequestID + 1

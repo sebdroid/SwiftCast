@@ -61,6 +61,17 @@ struct ClientTests {
         #expect(await client.state == .connected)
     }
 
+    @Test func nonObjectPayloadIsRejectedLocally() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let sentBefore = mock.sentMessages.count
+        await #expect(throws: CastError.invalidPayload("Request payload must be a JSON object")) {
+            _ = try await client.request(["GET_STATUS"] as JSONValue, namespace: .receiver, to: "receiver-0")
+        }
+        #expect(mock.sentMessages.count == sentBefore)
+    }
+
     @Test func requestIsCancellable() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)

@@ -14,6 +14,8 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
     case malformedMessage(String)
     /// The receiver refused to launch an application.
     case launchFailed(reason: String?)
+    /// A request payload was rejected locally, before anything was sent.
+    case invalidPayload(String)
     /// The receiver or application rejected a request.
     case invalidRequest(MediaErrorInfo)
     /// Media failed to load on the receiver.
@@ -41,6 +43,7 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
         case .timeout: "The Cast device did not respond in time."
         case .malformedMessage(let message): "Malformed message: \(message)"
         case .launchFailed(let reason): "Failed to launch app\(reason.map { ": \($0)" } ?? ".")"
+        case .invalidPayload(let message): "Invalid payload: \(message)"
         case .invalidRequest(let info): "Invalid request\(Self.suffix(info))"
         case .loadFailed(let info): "Media failed to load\(Self.suffix(info))"
         case .loadCancelled(let info): "The media load was cancelled\(Self.suffix(info))"

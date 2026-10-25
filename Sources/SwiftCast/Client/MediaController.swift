@@ -131,7 +131,9 @@ public actor MediaController {
         try await sessionCommand("PAUSE")
     }
 
-    /// Stops playback and unloads the media.
+    /// Stops playback and unloads the media. The receiver normally answers
+    /// with an `IDLE` status for the stopped session, which is kept so a UI
+    /// can go on showing what was playing.
     @discardableResult
     public func stop() async throws -> MediaStatus? {
         try await sessionCommand("STOP")
@@ -219,7 +221,7 @@ public actor MediaController {
     @discardableResult
     public func refreshStatus() async throws -> MediaStatus? {
         let response = try await send(["type": "GET_STATUS"] as JSONValue, timeout: nil)
-        return commit(try parseStatus(response, preferring: status?.mediaSessionId))
+        return commit(try parseStatus(response))
     }
 
     /// Stops listening and closes the virtual connection to the application.
@@ -247,12 +249,7 @@ public actor MediaController {
             if status?.mediaSessionId == sessionID { update(nil) }
             throw error
         }
-        let newStatus = try parseStatus(response, preferring: sessionID)
-        if type == "STOP" {
-            update(nil)
-            return nil
-        }
-        return commit(newStatus)
+        return commit(try parseStatus(response))
     }
 
     private func send(_ payload: some Encodable & Sendable, timeout: Duration?) async throws -> InboundMessage {
@@ -261,7 +258,7 @@ public actor MediaController {
     }
 
     private func requireStatus(_ response: InboundMessage) throws -> MediaStatus {
-        guard let status = commit(try parseStatus(response, preferring: nil)) else {
+        guard let status = commit(try parseStatus(response)) else {
             throw CastError.unexpectedResponse("Media status missing from response")
         }
         return status
@@ -275,28 +272,26 @@ public actor MediaController {
         guard message.type == "MEDIA_STATUS", (message.requestID ?? 0) == 0 else { return }
         // As in Chrome, a broadcast without a usable status leaves the current state alone.
         let parsed: MediaStatus?
-        do { parsed = try parseStatus(message, preferring: status?.mediaSessionId) } catch { return }
+        do { parsed = try parseStatus(message) } catch { return }
         commit(parsed)
     }
 
     /// `nil` means the receiver has no media session. Throws, without
     /// touching state, when the message is not a usable `MEDIA_STATUS`.
-    private func parseStatus(_ message: InboundMessage, preferring preferredSessionID: Int?) throws -> MediaStatus? {
+    /// Only the first entry is read: a status message carries just the
+    /// sessions that changed or were asked about.
+    private func parseStatus(_ message: InboundMessage) throws -> MediaStatus? {
         guard message.type == "MEDIA_STATUS" else {
             throw CastError.unexpectedResponse("Expected MEDIA_STATUS, got \(message.type ?? "untyped message")")
         }
         guard let entries = message.json?["status"]?.arrayValue else {
             throw CastError.malformedMessage("MEDIA_STATUS has no status list")
         }
-        guard !entries.isEmpty else { return nil }
-        let decoded = entries.map { try? $0.decode(MediaStatus.self) }
-        if let preferredSessionID, let match = decoded.lazy.compactMap({ $0 }).first(where: { $0.mediaSessionId == preferredSessionID }) {
-            return match
-        }
-        guard let first = decoded[0] else {
+        guard let first = entries.first else { return nil }
+        guard let decoded = try? first.decode(MediaStatus.self) else {
             throw CastError.malformedMessage("Media status entry could not be decoded")
         }
-        return first
+        return decoded
     }
 
     @discardableResult
