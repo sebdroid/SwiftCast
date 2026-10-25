@@ -57,7 +57,7 @@ struct DiscoveryTests {
         #expect(wide.rawValue == .max)
     }
 
-    @Test func capabilityBitsMatchTheCastSDK() {
+    @Test func capabilityBitsMatchTheTXTRecordFlags() {
         typealias C = CastDevice.Capabilities
         #expect(C.dynamicGroup.rawValue == 1 << 6)
         #expect(C.multiChannelGroup.rawValue == 1 << 7)
@@ -89,7 +89,7 @@ struct DiscoveryTests {
         #expect(bare.iconPath == nil)
     }
 
-    @Test func kindFollowsCastSDKPrecedence() {
+    @Test func kindPrefersGroupThenVideoThenAudio() {
         func kind(_ caps: CastDevice.Capabilities) -> CastDevice.Kind {
             CastDevice(id: "x", name: "x", capabilities: caps, endpoint: service("x")).kind
         }
@@ -124,6 +124,34 @@ struct DiscoveryTests {
         )
         #expect(CastDiscovery.devices(from: [en1, wifiB]).map(\.name) == ["Wifi B"])
         #expect(CastDiscovery.devices(from: [wifiB, en1]).map(\.name) == ["Wifi B"])
+    }
+
+    @Test func keepsThePreviouslyChosenEndpointForAnID() {
+        func candidate(_ serviceName: String, id: String = "abc") -> CastDiscovery.BrowseCandidate {
+            .init(device: device(id: id, name: serviceName, service: serviceName), interfaceTypes: [.wifi], interfaceNames: ["en0"])
+        }
+        var chosen: [String: NWEndpoint] = [:]
+        let first = CastDiscovery.devices(from: [candidate("Real")], keeping: &chosen)
+        #expect(first.map(\.name) == ["Real"])
+        #expect(chosen["abc"] == service("Real"))
+
+        let contested = CastDiscovery.devices(from: [candidate("A"), candidate("Real")], keeping: &chosen)
+        #expect(contested.map(\.name) == ["Real"])
+        let reordered = CastDiscovery.devices(from: [candidate("Real"), candidate("A")], keeping: &chosen)
+        #expect(reordered.map(\.name) == ["Real"])
+
+        let fresh = CastDiscovery.devices(
+            from: [candidate("Real"), candidate("Y", id: "def"), candidate("X", id: "def")], keeping: &chosen
+        )
+        #expect(fresh.map(\.name) == ["Real", "X"])
+        #expect(chosen["def"] == service("X"))
+
+        let afterLoss = CastDiscovery.devices(from: [candidate("B"), candidate("A")], keeping: &chosen)
+        #expect(afterLoss.map(\.name) == ["A"])
+        #expect(chosen == ["abc": service("A")])
+
+        let returned = CastDiscovery.devices(from: [candidate("Real"), candidate("A")], keeping: &chosen)
+        #expect(returned.map(\.name) == ["A"])
     }
 
     @Test func sortsByNameThenID() {

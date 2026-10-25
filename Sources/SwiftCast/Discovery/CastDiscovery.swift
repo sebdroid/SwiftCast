@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import Observation
+import os
 
 /// Discovers Cast devices on the local network using Bonjour (`_googlecast._tcp`).
 ///
@@ -43,8 +44,11 @@ public enum CastDiscovery {
                     break
                 }
             }
+            let chosen = OSAllocatedUnfairLock<[String: NWEndpoint]>(initialState: [:])
             browser.browseResultsChangedHandler = { results, _ in
-                continuation.yield(.devices(devices(from: results)))
+                let candidates = candidates(from: results)
+                let found = chosen.withLock { devices(from: candidates, keeping: &$0) }
+                continuation.yield(.devices(found))
             }
             continuation.onTermination = { _ in browser.cancel() }
             browser.start(queue: DispatchQueue(label: "SwiftCast.CastDiscovery"))
@@ -91,7 +95,7 @@ public enum CastDiscovery {
         }
     }
 
-    struct BrowseCandidate {
+    struct BrowseCandidate: Sendable {
         let device: CastDevice
         let interfaceTypes: [NWInterface.InterfaceType]
         let interfaceNames: [String]
@@ -112,8 +116,8 @@ public enum CastDiscovery {
         }
     }
 
-    static func devices(from results: Set<NWBrowser.Result>) -> [CastDevice] {
-        devices(from: results.compactMap { result -> BrowseCandidate? in
+    static func candidates(from results: Set<NWBrowser.Result>) -> [BrowseCandidate] {
+        results.compactMap { result -> BrowseCandidate? in
             var txt: [String: String] = [:]
             if case .bonjour(let record) = result.metadata {
                 for (key, entry) in record {
@@ -126,17 +130,36 @@ public enum CastDiscovery {
                 interfaceTypes: result.interfaces.map(\.type),
                 interfaceNames: result.interfaces.map(\.name)
             )
-        })
+        }
+    }
+
+    static func devices(from candidates: [BrowseCandidate]) -> [CastDevice] {
+        var chosen: [String: NWEndpoint] = [:]
+        return devices(from: candidates, keeping: &chosen)
     }
 
     /// The same device can be reported once per network interface, or under
-    /// several service names, so one result per `id` is kept by a fixed rule.
-    static func devices(from candidates: [BrowseCandidate]) -> [CastDevice] {
+    /// several service names, so one result per `id` is kept. The endpoint
+    /// kept last time wins while it is still reported, so a newcomer copying
+    /// a known device's `id` cannot displace it; otherwise a fixed rule picks.
+    /// `chosen` is updated to the endpoints kept this time.
+    static func devices(from candidates: [BrowseCandidate], keeping chosen: inout [String: NWEndpoint]) -> [CastDevice] {
         var byID: [String: BrowseCandidate] = [:]
         for candidate in candidates {
-            if let current = byID[candidate.device.id], !candidate.isPreferred(over: current) { continue }
-            byID[candidate.device.id] = candidate
+            let id = candidate.device.id
+            if let current = byID[id] {
+                let previous = chosen[id]
+                let keepsPrevious = current.device.endpoint == previous
+                let isPrevious = candidate.device.endpoint == previous
+                if keepsPrevious != isPrevious {
+                    if keepsPrevious { continue }
+                } else if !candidate.isPreferred(over: current) {
+                    continue
+                }
+            }
+            byID[id] = candidate
         }
+        chosen = byID.mapValues(\.device.endpoint)
         return sorted(byID.values.map(\.device))
     }
 
