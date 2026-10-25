@@ -270,7 +270,11 @@ public struct MediaMetadata: Codable, Sendable, Hashable {
         case creationDateTime, location, latitude, longitude
     }
 
-    /// The pre-Web-Receiver spelling of the air date key, read but never written.
+    /// The capital-D air date key from Google's media messages reference, read but never written.
+    ///
+    /// Encoding emits only `originalAirdate`, matching `chrome.cast.media.TvShowMediaMetadata`
+    /// and the default media receiver. A custom receiver written against the older messages
+    /// document needs to read the lowercase key.
     private enum LegacyCodingKeys: String, CodingKey {
         case originalAirDate
     }
