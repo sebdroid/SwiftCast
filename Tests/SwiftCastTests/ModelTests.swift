@@ -112,4 +112,21 @@ struct ModelTests {
         #expect(group.name == "Google-Cast-Group-1")
         #expect(group.isGroup)
     }
+
+    @Test func errorDescriptionsDropControlAndFormatScalars() {
+        let hostile = "BAD\u{1B}[31m\u{202E}REASON\u{2028}\u{07}"
+        let launch = CastError.launchFailed(reason: hostile)
+        #expect(launch.errorDescription == "Failed to launch app: BAD[31mREASON")
+        let media = CastError.loadFailed(MediaErrorInfo(type: "LOAD_FAILED", reason: .unknown(hostile), detailedErrorCode: 104))
+        #expect(media.errorDescription == "Media failed to load: BAD[31mREASON (code 104)")
+        let response = CastError.unexpectedResponse("Expected MEDIA_STATUS, got \u{1B}]0;x\u{07}OOPS")
+        #expect(response.errorDescription == "Unexpected response: Expected MEDIA_STATUS, got ]0;xOOPS")
+    }
+
+    @Test func errorDescriptionsKeepOrdinaryText() {
+        let launch = CastError.launchFailed(reason: "App not found, try again")
+        #expect(launch.errorDescription == "Failed to launch app: App not found, try again")
+        let media = CastError.loadFailed(MediaErrorInfo(type: "LOAD_FAILED", reason: .unknown("CUSTOM_REASON")))
+        #expect(media.errorDescription == "Media failed to load: CUSTOM_REASON")
+    }
 }

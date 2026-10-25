@@ -38,12 +38,12 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .notConnected: "Not connected to the Cast device."
-        case .connectionFailed(let message): "Connection failed: \(message)"
+        case .connectionFailed(let message): "Connection failed: \(message.displaySanitized)"
         case .heartbeatTimeout: "The Cast device stopped responding."
         case .timeout: "The Cast device did not respond in time."
-        case .malformedMessage(let message): "Malformed message: \(message)"
-        case .launchFailed(let reason): "Failed to launch app\(reason.map { ": \($0)" } ?? ".")"
-        case .invalidPayload(let message): "Invalid payload: \(message)"
+        case .malformedMessage(let message): "Malformed message: \(message.displaySanitized)"
+        case .launchFailed(let reason): "Failed to launch app\(reason.map { ": \($0.displaySanitized)" } ?? ".")"
+        case .invalidPayload(let message): "Invalid payload: \(message.displaySanitized)"
         case .invalidRequest(let info): "Invalid request\(Self.suffix(info))"
         case .loadFailed(let info): "Media failed to load\(Self.suffix(info))"
         case .loadCancelled(let info): "The media load was cancelled\(Self.suffix(info))"
@@ -52,7 +52,7 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
         case .noMediaSession: "There is no active media session."
         case .sessionClosed: "The Cast session was closed."
         case .applicationNotRunning: "The application is not running on the Cast device."
-        case .unexpectedResponse(let message): "Unexpected response: \(message)"
+        case .unexpectedResponse(let message): "Unexpected response: \(message.displaySanitized)"
         }
     }
 
@@ -68,6 +68,6 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
     }
 
     private static func suffix(_ info: MediaErrorInfo) -> String {
-        info.summary.map { ": \($0)" } ?? "."
+        info.summary.map { ": \($0.displaySanitized)" } ?? "."
     }
 }
