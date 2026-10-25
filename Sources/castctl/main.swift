@@ -44,8 +44,8 @@ func describe(_ status: MediaStatus?) {
     guard let status else { print("media: none"); return }
     let time = status.currentTime.map { String(format: "%.1fs", $0) } ?? "?"
     let duration = status.media?.duration.map { String(format: "%.1fs", $0) } ?? "?"
-    let reason = status.idleReason.map { " (\($0.rawValue))" } ?? ""
-    print("media: \(sanitized(status.media?.metadata?.title ?? status.media?.contentId ?? "unknown")) \(status.playerState.rawValue)\(reason) \(time)/\(duration)")
+    let reason = status.idleReason.map { " (\(sanitized($0.rawValue)))" } ?? ""
+    print("media: \(sanitized(status.media?.metadata?.title ?? status.media?.contentId ?? "unknown")) \(sanitized(status.playerState.rawValue))\(reason) \(time)/\(duration)")
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
@@ -110,12 +110,12 @@ do {
             for await status in await client.receiverStatusUpdates() { describe(status) }
         }
         let stateWatcher = Task {
-            for await state in states { print("state: \(state)") }
+            for await state in states { print("state: \(sanitized("\(state)"))") }
         }
         try await Task.sleep(for: .seconds(seconds))
         watcher.cancel()
         stateWatcher.cancel()
-        print("final state: \(await client.state)")
+        print("final state: \(sanitized("\(await client.state)"))")
     case "volume":
         guard arguments.count >= 3, let level = Double(arguments[2]) else { usage() }
         describe(try await client.receiver.setVolume(level))
@@ -130,6 +130,6 @@ do {
     }
     await client.disconnect()
 } catch {
-    print("error: \(error.localizedDescription)")
+    print("error: \(sanitized(error.localizedDescription))")
     exit(1)
 }
