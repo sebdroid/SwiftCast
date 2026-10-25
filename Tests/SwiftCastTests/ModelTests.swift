@@ -66,6 +66,22 @@ struct ModelTests {
         #expect(status.estimatedTime(after: 3) == 10)
     }
 
+    @Test func statusEntryCarriesPositionForwardWhenCurrentTimeIsMissing() throws {
+        var cached = MediaStatus(mediaSessionId: 1, playerState: .playing, currentTime: 10, playbackRate: 2)
+        cached.media = MediaInformation(contentId: "x", contentType: "video/mp4", duration: 100)
+        let volumeOnly: JSONValue = ["mediaSessionId": 1, "volume": ["level": 0.5]]
+        let entry = try volumeOnly.decode(MediaStatusEntry.self)
+        let merged = entry.applied(to: cached, elapsed: 3)
+        #expect(merged.currentTime == 16)
+        #expect(merged.playerState == .playing)
+        #expect(merged.volume?.level == 0.5)
+        #expect(merged.media == cached.media)
+
+        let timed: JSONValue = ["mediaSessionId": 1, "currentTime": 50]
+        let timedEntry = try timed.decode(MediaStatusEntry.self)
+        #expect(timedEntry.applied(to: cached, elapsed: 3).currentTime == 50)
+    }
+
     @Test func jsonValueLiteralsAndAccessors() throws {
         let value: JSONValue = ["a": [1, 2.5, "x", true, nil], "b": ["c": "d"]]
         #expect(value["a"]?.arrayValue?.count == 5)

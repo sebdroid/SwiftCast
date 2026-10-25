@@ -257,8 +257,10 @@ public actor MediaController {
         return try await client.request(payload, namespace: .media, to: application.transportId, timeout: timeout)
     }
 
+    /// Loads start a new media session, so their status replaces the cache
+    /// even when the receiver reuses the session id.
     private func requireStatus(_ response: InboundMessage) throws -> MediaStatus {
-        guard let status = commit(try parseStatus(response)) else {
+        guard let status = commit(try parseStatus(response), replacing: true) else {
             throw CastError.unexpectedResponse("Media status missing from response")
         }
         return status
@@ -271,7 +273,7 @@ public actor MediaController {
         // could overwrite the newer status from a LOAD.
         guard message.type == "MEDIA_STATUS", (message.requestID ?? 0) == 0 else { return }
         // As in Chrome, a broadcast without a usable status leaves the current state alone.
-        let parsed: MediaStatus?
+        let parsed: MediaStatusEntry?
         do { parsed = try parseStatus(message) } catch { return }
         commit(parsed)
     }
@@ -280,7 +282,7 @@ public actor MediaController {
     /// touching state, when the message is not a usable `MEDIA_STATUS`.
     /// Only the first entry is read: a status message carries just the
     /// sessions that changed or were asked about.
-    private func parseStatus(_ message: InboundMessage) throws -> MediaStatus? {
+    private func parseStatus(_ message: InboundMessage) throws -> MediaStatusEntry? {
         guard message.type == "MEDIA_STATUS" else {
             throw CastError.unexpectedResponse("Expected MEDIA_STATUS, got \(message.type ?? "untyped message")")
         }
@@ -288,20 +290,27 @@ public actor MediaController {
             throw CastError.malformedMessage("MEDIA_STATUS has no status list")
         }
         guard let first = entries.first else { return nil }
-        guard let decoded = try? first.decode(MediaStatus.self) else {
+        guard let decoded = try? first.decode(MediaStatusEntry.self) else {
             throw CastError.malformedMessage("Media status entry could not be decoded")
         }
         return decoded
     }
 
+    /// Applies an entry onto the cached status of the same media session.
+    /// A different session, or `replacing`, starts from the entry alone so
+    /// nothing of the previous session's media or queue survives.
     @discardableResult
-    private func commit(_ parsed: MediaStatus?) -> MediaStatus? {
-        guard var newStatus = parsed else {
+    private func commit(_ entry: MediaStatusEntry?, replacing: Bool = false) -> MediaStatus? {
+        guard let entry else {
             update(nil)
             return nil
         }
-        if newStatus.media == nil, let previous = status, previous.mediaSessionId == newStatus.mediaSessionId {
-            newStatus.media = previous.media
+        let newStatus: MediaStatus
+        if !replacing, let cached = status, cached.mediaSessionId == entry.status.mediaSessionId {
+            let elapsed = statusDate.map { max(0, Date().timeIntervalSince($0)) } ?? 0
+            newStatus = entry.applied(to: cached, elapsed: elapsed)
+        } else {
+            newStatus = entry.status
         }
         update(newStatus)
         return newStatus
