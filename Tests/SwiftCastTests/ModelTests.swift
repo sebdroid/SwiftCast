@@ -76,11 +76,11 @@ struct ModelTests {
         #expect(try JSONDecoder().decode(JSONValue.self, from: data) == value)
     }
 
-    @Test func parsesDeviceTXTRecord() {
-        let device = CastDevice(
+    @Test func parsesDeviceTXTRecord() throws {
+        let device = try #require(CastDevice(
             serviceEndpoint: .service(name: "Chromecast-abc", type: "_googlecast._tcp", domain: "local.", interface: nil),
             txt: ["id": "abc123", "fn": "Living Room", "md": "Chromecast Ultra", "ca": "201221", "rs": "YouTube"]
-        )
+        ))
         #expect(device.id == "abc123")
         #expect(device.name == "Living Room")
         #expect(device.modelName == "Chromecast Ultra")
@@ -88,10 +88,10 @@ struct ModelTests {
         #expect(!device.isGroup)
         #expect(device.statusText == "YouTube")
 
-        let group = CastDevice(
+        let group = try #require(CastDevice(
             serviceEndpoint: .service(name: "Google-Cast-Group-1", type: "_googlecast._tcp", domain: "local.", interface: nil),
             txt: ["ca": "2084", "fn": ""]
-        )
+        ))
         #expect(group.id == "Google-Cast-Group-1")
         #expect(group.name == "Google-Cast-Group-1")
         #expect(group.isGroup)

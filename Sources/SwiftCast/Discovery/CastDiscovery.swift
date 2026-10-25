@@ -91,24 +91,108 @@ public enum CastDiscovery {
         }
     }
 
+    struct BrowseCandidate {
+        let device: CastDevice
+        let interfaceTypes: [NWInterface.InterfaceType]
+        let interfaceNames: [String]
+
+        var serviceName: String {
+            if case .service(let name, _, _, _) = device.endpoint { return name }
+            return ""
+        }
+
+        var isOnPrimaryNetwork: Bool {
+            interfaceTypes.contains(.wifi) || interfaceTypes.contains(.wiredEthernet)
+        }
+
+        func isPreferred(over other: BrowseCandidate) -> Bool {
+            if isOnPrimaryNetwork != other.isOnPrimaryNetwork { return isOnPrimaryNetwork }
+            if serviceName != other.serviceName { return serviceName < other.serviceName }
+            return interfaceNames.joined(separator: ",") < other.interfaceNames.joined(separator: ",")
+        }
+    }
+
     static func devices(from results: Set<NWBrowser.Result>) -> [CastDevice] {
-        var byID: [String: CastDevice] = [:]
-        for result in results {
+        devices(from: results.compactMap { result -> BrowseCandidate? in
             var txt: [String: String] = [:]
             if case .bonjour(let record) = result.metadata {
                 for (key, entry) in record {
                     if case .string(let value) = entry { txt[key] = value } else { txt[key] = "" }
                 }
             }
-            let device = CastDevice(serviceEndpoint: result.endpoint, txt: txt)
-            // The same device can be reported once per network interface.
-            if byID[device.id] == nil { byID[device.id] = device }
+            guard let device = CastDevice(serviceEndpoint: result.endpoint, txt: txt) else { return nil }
+            return BrowseCandidate(
+                device: device,
+                interfaceTypes: result.interfaces.map(\.type),
+                interfaceNames: result.interfaces.map(\.name)
+            )
+        })
+    }
+
+    /// The same device can be reported once per network interface, or under
+    /// several service names, so one result per `id` is kept by a fixed rule.
+    static func devices(from candidates: [BrowseCandidate]) -> [CastDevice] {
+        var byID: [String: BrowseCandidate] = [:]
+        for candidate in candidates {
+            if let current = byID[candidate.device.id], !candidate.isPreferred(over: current) { continue }
+            byID[candidate.device.id] = candidate
         }
-        return byID.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return sorted(byID.values.map(\.device))
+    }
+
+    static func sorted(_ devices: [CastDevice]) -> [CastDevice] {
+        devices.sorted {
+            switch $0.name.localizedStandardCompare($1.name) {
+            case .orderedAscending: true
+            case .orderedDescending: false
+            case .orderedSame: $0.id < $1.id
+            }
+        }
+    }
+}
+
+/// Keeps devices listed for a grace period after they drop out of the browse
+/// results, so a brief mDNS gap does not make them flicker out of a list.
+struct DeviceRoster<Instant: InstantProtocol> {
+    private struct Entry {
+        var device: CastDevice
+        var missingSince: Instant?
+    }
+
+    let gracePeriod: Instant.Duration
+    private var entries: [String: Entry] = [:]
+
+    init(gracePeriod: Instant.Duration) {
+        self.gracePeriod = gracePeriod
+    }
+
+    var devices: [CastDevice] { CastDiscovery.sorted(entries.values.map(\.device)) }
+
+    mutating func update(_ found: [CastDevice], at now: Instant) {
+        let foundIDs = Set(found.map(\.id))
+        for id in entries.keys where !foundIDs.contains(id) && entries[id]?.missingSince == nil {
+            entries[id]?.missingSince = now
+        }
+        for device in found {
+            entries[device.id] = Entry(device: device, missingSince: nil)
+        }
+    }
+
+    /// Removes devices missing for at least the grace period, returning
+    /// whether any were removed.
+    mutating func expire(at now: Instant) -> Bool {
+        let expired = entries.filter { _, entry in
+            entry.missingSince.map { $0.duration(to: now) >= gracePeriod } ?? false
+        }
+        for id in expired.keys { entries[id] = nil }
+        return !expired.isEmpty
     }
 }
 
 /// An observable Cast device browser for SwiftUI.
+///
+/// A device that drops out of the browse results stays listed for 30 seconds
+/// in case it comes back, matching the Google Cast SDK.
 ///
 /// ```swift
 /// @State private var browser = CastDeviceBrowser()
@@ -119,23 +203,50 @@ public enum CastDiscovery {
 @MainActor
 @Observable
 public final class CastDeviceBrowser {
-    /// Devices currently visible on the network.
+    /// Devices currently visible on the network, or seen within the grace period.
     public private(set) var devices: [CastDevice] = []
     /// A message describing why browsing is blocked or failed, if it is.
     public private(set) var problem: String?
     /// Whether the browser is running.
     public private(set) var isBrowsing = false
 
-    public init() {}
+    private let events: @Sendable () -> AsyncStream<CastDiscovery.Event>
+    private let sweepInterval: Duration
+    private let clock = ContinuousClock()
+    private var roster: DeviceRoster<ContinuousClock.Instant>
+
+    public convenience init() {
+        self.init(gracePeriod: .seconds(30), sweepInterval: .seconds(5)) { CastDiscovery.events() }
+    }
+
+    init(
+        gracePeriod: Duration,
+        sweepInterval: Duration,
+        events: @escaping @Sendable () -> AsyncStream<CastDiscovery.Event>
+    ) {
+        self.events = events
+        self.sweepInterval = sweepInterval
+        self.roster = DeviceRoster(gracePeriod: gracePeriod)
+    }
 
     /// Browses until the calling task is cancelled (e.g. from `.task {}`).
     public func run() async {
         isBrowsing = true
-        defer { isBrowsing = false }
-        for await event in CastDiscovery.events() {
+        let sweeper = Task { [weak self, clock, sweepInterval] in
+            while !Task.isCancelled {
+                try? await clock.sleep(for: sweepInterval)
+                self?.sweep()
+            }
+        }
+        defer {
+            sweeper.cancel()
+            isBrowsing = false
+        }
+        for await event in events() {
             switch event {
             case .devices(let found):
-                devices = found
+                roster.update(found, at: clock.now)
+                devices = roster.devices
                 problem = nil
             case .waiting(let message):
                 problem = message
@@ -143,5 +254,9 @@ public final class CastDeviceBrowser {
                 problem = message
             }
         }
+    }
+
+    private func sweep() {
+        if roster.expire(at: clock.now) { devices = roster.devices }
     }
 }

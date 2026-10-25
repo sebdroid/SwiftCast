@@ -51,9 +51,18 @@ public struct CastDevicePicker: View {
         .task { await browser.run() }
     }
 
+    private func icon(for kind: CastDevice.Kind) -> String {
+        switch kind {
+        case .group: "hifispeaker.2"
+        case .tv: "tv"
+        case .speaker: "hifispeaker"
+        case .generic: "dot.radiowaves.left.and.right"
+        }
+    }
+
     private func row(for device: CastDevice) -> some View {
         HStack {
-            Image(systemName: device.isGroup ? "hifispeaker.2" : device.supportsVideo ? "tv" : "hifispeaker")
+            Image(systemName: icon(for: device.kind))
                 .frame(width: 28)
             VStack(alignment: .leading) {
                 Text(device.name)
