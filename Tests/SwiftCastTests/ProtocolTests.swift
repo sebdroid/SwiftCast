@@ -210,11 +210,10 @@ struct ProtocolTests {
         #expect(framed.prefix(4) == Data([0x00, 0x01, 0x00, 0x00]))
 
         let oversize = binary(bodyLength: FrameCodec.maximumOutboundBodyLength + 1)
-        let oversizeError = #expect(throws: CastError.self) { try FrameCodec.frame(oversize) }
-        #expect(oversizeError.map { if case .invalidRequest = $0 { true } else { false } } == true)
+        #expect(throws: CastError.messageTooLarge(65_537)) { try FrameCodec.frame(oversize) }
+        #expect(CastError.messageTooLarge(65_537).errorDescription == "Message body of 65537 bytes exceeds the 65536 byte limit")
 
-        let emptyError = #expect(throws: CastError.self) { try FrameCodec.frame(body: Data()) }
-        #expect(emptyError.map { if case .invalidRequest = $0 { true } else { false } } == true)
+        #expect(throws: CastError.malformedMessage("Empty message body")) { try FrameCodec.frame(body: Data()) }
     }
 }
 
@@ -266,7 +265,7 @@ struct ClientFramingTests {
         let error = await #expect(throws: CastError.self) {
             try await client.send(binary: Data(count: FrameCodec.maximumOutboundBodyLength), namespace: .media, to: "receiver-0")
         }
-        #expect(error.map { if case .invalidRequest = $0 { true } else { false } } == true)
+        #expect(error.map { if case .messageTooLarge = $0 { true } else { false } } == true)
         #expect(await client.state == .connected)
         try await client.send(binary: Data([1]), namespace: .media, to: "receiver-0")
     }

@@ -8,22 +8,24 @@ enum FrameCodec {
     /// receivers enforce).
     static let maximumOutboundBodyLength = 65_536
 
-    /// Largest body accepted from a receiver: twice Chromium's 64 KiB limit,
-    /// so a device that overshoots a little gets headroom while memory stays bounded.
+    /// Largest body accepted from a receiver: a 128 KiB frame less the 4-byte
+    /// length prefix, so a device that overshoots Chromium's 64 KiB limit gets
+    /// headroom while memory stays bounded.
     static let maximumInboundBodyLength = 131_068
 
-    /// Frames a message, throwing ``CastError/invalidRequest(reason:)`` when
-    /// its body is empty or larger than ``maximumOutboundBodyLength``.
+    /// Frames a message, throwing ``CastError/malformedMessage(_:)`` when its
+    /// body is empty or ``CastError/messageTooLarge(_:)`` when it is larger
+    /// than ``maximumOutboundBodyLength``.
     static func frame(_ message: CastMessage) throws -> Data {
         try frame(body: message.serialized())
     }
 
     static func frame(body: Data) throws -> Data {
         guard !body.isEmpty else {
-            throw CastError.invalidRequest(reason: "Message body is empty")
+            throw CastError.malformedMessage("Empty message body")
         }
         guard body.count <= maximumOutboundBodyLength else {
-            throw CastError.invalidRequest(reason: "Message body of \(body.count) bytes exceeds \(maximumOutboundBodyLength)")
+            throw CastError.messageTooLarge(body.count)
         }
         var out = Data(capacity: body.count + headerLength)
         withUnsafeBytes(of: UInt32(body.count).bigEndian) { out.append(contentsOf: $0) }
