@@ -46,6 +46,7 @@ struct ModelTests {
         #"{"applications":[{"appId":"CC1AD845","sessionId":"s1","transportId":"t1"},{"appId":"233637DE","displayName":"YouTube","sessionId":"s2"}]}"#,
         #"{"applications":[{"appId":"CC1AD845","sessionId":"","transportId":"t1"}]}"#,
         #"{"applications":[{"appId":"CC1AD845","sessionId":"s1","transportId":""}]}"#,
+        #"{"applications":[{"appId":"CC1AD845","sessionId":"s1","transportId":"t1"},{"appId":"ABCDEF12","sessionId":"","transportId":"receiver-0"}]}"#,
         #"{"applications":{"appId":"CC1AD845","sessionId":"s1","transportId":"t1"},"volume":{"level":0.5}}"#,
     ])
     func receiverStatusWithIncompleteApplicationsFailsToDecode(json: String) {
