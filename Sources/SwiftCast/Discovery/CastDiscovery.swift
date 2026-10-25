@@ -178,6 +178,14 @@ struct DeviceRoster<Instant: InstantProtocol> {
         }
     }
 
+    /// Marks every listed device as unseen, so devices left over from a previous
+    /// browse expire unless the new browse reports them again.
+    mutating func markAllMissing(at now: Instant) {
+        for id in entries.keys where entries[id]?.missingSince == nil {
+            entries[id]?.missingSince = now
+        }
+    }
+
     /// Removes devices missing for at least the grace period, returning
     /// whether any were removed.
     mutating func expire(at now: Instant) -> Bool {
@@ -192,7 +200,7 @@ struct DeviceRoster<Instant: InstantProtocol> {
 /// An observable Cast device browser for SwiftUI.
 ///
 /// A device that drops out of the browse results stays listed for 30 seconds
-/// in case it comes back, matching the Google Cast SDK.
+/// in case it comes back, so a lossy mDNS announcement does not make it flicker.
 ///
 /// ```swift
 /// @State private var browser = CastDeviceBrowser()
@@ -232,6 +240,7 @@ public final class CastDeviceBrowser {
     /// Browses until the calling task is cancelled (e.g. from `.task {}`).
     public func run() async {
         isBrowsing = true
+        roster.markAllMissing(at: clock.now)
         let sweeper = Task { [weak self, clock, sweepInterval] in
             while !Task.isCancelled {
                 try? await clock.sleep(for: sweepInterval)

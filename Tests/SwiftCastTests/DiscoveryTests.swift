@@ -133,6 +133,20 @@ struct DiscoveryTests {
         #expect(devices.map(\.id) == ["c", "a", "b"])
     }
 
+    @Test func rosterTreatsEverythingAsUnseenOnRestart() {
+        let start = ContinuousClock.now
+        var roster = DeviceRoster<ContinuousClock.Instant>(gracePeriod: .seconds(30))
+        roster.update([device(id: "tv", name: "TV"), device(id: "speaker", name: "Speaker")], at: start)
+        roster.markAllMissing(at: start + .seconds(60))
+        roster.update([device(id: "tv", name: "TV")], at: start + .seconds(61))
+        let expiredEarly = roster.expire(at: start + .seconds(80))
+        #expect(!expiredEarly)
+        #expect(roster.devices.map(\.id) == ["speaker", "tv"])
+        let expiredLate = roster.expire(at: start + .seconds(90))
+        #expect(expiredLate)
+        #expect(roster.devices.map(\.id) == ["tv"])
+    }
+
     @Test func rosterKeepsMissingDevicesForTheGracePeriod() {
         let start = ContinuousClock.now
         var roster = DeviceRoster<ContinuousClock.Instant>(gracePeriod: .seconds(30))
