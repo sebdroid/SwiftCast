@@ -129,4 +129,19 @@ struct ModelTests {
         let media = CastError.loadFailed(MediaErrorInfo(type: "LOAD_FAILED", reason: .unknown("CUSTOM_REASON")))
         #expect(media.errorDescription == "Media failed to load: CUSTOM_REASON")
     }
+
+    @Test func errorDescriptionsDropInvisibleFormatScalars() {
+        let launch = CastError.launchFailed(reason: "Den\u{200E}\u{2066}TV\u{FEFF}\u{2029}")
+        #expect(launch.errorDescription == "Failed to launch app: DenTV")
+    }
+
+    @Test func displaySanitizedKeepsZeroWidthJoinerSequences() {
+        let text = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"
+        #expect(Array(text.displaySanitized.unicodeScalars) == Array(text.unicodeScalars))
+    }
+
+    @Test func displaySanitizedKeepsZeroWidthNonJoiner() {
+        let text = "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}"
+        #expect(Array(text.displaySanitized.unicodeScalars) == Array(text.unicodeScalars))
+    }
 }
