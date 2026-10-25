@@ -143,13 +143,21 @@ public struct ReceiverStatus: Codable, Sendable, Hashable {
         self.isStandBy = isStandBy
     }
 
-    /// Decodes leniently: applications that fail to decode, or that claim the
-    /// platform receiver's transport, are dropped instead of failing the whole status.
+    /// Throws if `applications` is not an array or any application in it is
+    /// malformed or has an empty `sessionId` or `transportId`, so an incomplete
+    /// list never looks like the full set of running apps. Applications that
+    /// claim the platform receiver's transport are dropped. The volume and
+    /// input flags decode leniently.
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        applications = (try? container.decodeIfPresent([Lenient<CastApplication>].self, forKey: .applications))?
-            .compactMap(\.value)
-            .filter { $0.transportId != CastEndpoint.platformReceiver }
+        let decoded = try container.decodeIfPresent([CastApplication].self, forKey: .applications)
+        if let index = decoded?.firstIndex(where: { $0.sessionId.isEmpty || $0.transportId.isEmpty }) {
+            throw DecodingError.dataCorrupted(DecodingError.Context(
+                codingPath: container.codingPath + [CodingKeys.applications],
+                debugDescription: "Application at index \(index) has an empty sessionId or transportId."
+            ))
+        }
+        applications = decoded?.filter { $0.transportId != CastEndpoint.platformReceiver }
         volume = try? container.decodeIfPresent(CastVolume.self, forKey: .volume)
         isActiveInput = try? container.decodeIfPresent(Bool.self, forKey: .isActiveInput)
         isStandBy = try? container.decodeIfPresent(Bool.self, forKey: .isStandBy)

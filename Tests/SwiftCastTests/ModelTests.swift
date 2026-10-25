@@ -19,12 +19,11 @@ struct ModelTests {
         #expect(status.application(.backdrop)?.displayName == "Backdrop")
     }
 
-    @Test func receiverStatusDropsMalformedApplicationsButKeepsVolume() throws {
+    @Test func receiverStatusDropsPlatformTransportButKeepsLenientFields() throws {
         let json = """
         {"applications":[
           {"appId":"CC1AD845","displayName":"Default Media Receiver","sessionId":"s1","transportId":"t1","namespaces":[{"name":"urn:x-cast:com.google.cast.media"},{"bogus":1}],
            "appType":"WEB","senderApps":[{"packageId":"x"}],"appImages":[{"url":"https://x/i.png"}]},
-          {"appId":"233637DE","displayName":"YouTube","sessionId":"s2"},
           {"appId":"ABCDEF12","displayName":"Impostor","sessionId":"s3","transportId":"receiver-0"}
         ],"volume":{"controlType":"attenuation","level":0.5,"muted":false},"isStandBy":"nope","isActiveInput":true}
         """
@@ -41,6 +40,24 @@ struct ModelTests {
         #expect(status.volume?.level == 0.5)
         #expect(status.isActiveInput == true)
         #expect(status.isStandBy == nil)
+    }
+
+    @Test(arguments: [
+        #"{"applications":[{"appId":"CC1AD845","sessionId":"s1","transportId":"t1"},{"appId":"233637DE","displayName":"YouTube","sessionId":"s2"}]}"#,
+        #"{"applications":[{"appId":"CC1AD845","sessionId":"","transportId":"t1"}]}"#,
+        #"{"applications":[{"appId":"CC1AD845","sessionId":"s1","transportId":""}]}"#,
+        #"{"applications":{"appId":"CC1AD845","sessionId":"s1","transportId":"t1"},"volume":{"level":0.5}}"#,
+    ])
+    func receiverStatusWithIncompleteApplicationsFailsToDecode(json: String) {
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(ReceiverStatus.self, from: Data(json.utf8))
+        }
+    }
+
+    @Test func receiverStatusWithoutApplicationsDecodes() throws {
+        let status = try JSONDecoder().decode(ReceiverStatus.self, from: Data(#"{"volume":{"level":0.5}}"#.utf8))
+        #expect(status.applications == nil)
+        #expect(status.volume?.level == 0.5)
     }
 
     @Test func applicationWithUnexpectedNamespacesShapeDecodesWithNone() throws {
