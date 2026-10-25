@@ -264,9 +264,15 @@ public struct MediaMetadata: Codable, Sendable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case kind = "metadataType"
-        case title, subtitle, images, releaseDate, studio, seriesTitle, season, episode, originalAirDate
+        case title, subtitle, images, releaseDate, studio, seriesTitle, season, episode
+        case originalAirDate = "originalAirdate"
         case albumName, albumArtist, artist, composer, trackNumber, discNumber
         case creationDateTime, location, latitude, longitude
+    }
+
+    /// The pre-Web-Receiver spelling of the air date key, read but never written.
+    private enum LegacyCodingKeys: String, CodingKey {
+        case originalAirDate
     }
 
     public init(from decoder: any Decoder) throws {
@@ -280,7 +286,8 @@ public struct MediaMetadata: Codable, Sendable, Hashable {
         seriesTitle = try? c.decodeIfPresent(String.self, forKey: .seriesTitle)
         season = try? c.decodeIfPresent(Int.self, forKey: .season)
         episode = try? c.decodeIfPresent(Int.self, forKey: .episode)
-        originalAirDate = try? c.decodeIfPresent(String.self, forKey: .originalAirDate)
+        originalAirDate = (try? c.decodeIfPresent(String.self, forKey: .originalAirDate))
+            ?? (try? decoder.container(keyedBy: LegacyCodingKeys.self).decodeIfPresent(String.self, forKey: .originalAirDate))
         albumName = try? c.decodeIfPresent(String.self, forKey: .albumName)
         albumArtist = try? c.decodeIfPresent(String.self, forKey: .albumArtist)
         artist = try? c.decodeIfPresent(String.self, forKey: .artist)

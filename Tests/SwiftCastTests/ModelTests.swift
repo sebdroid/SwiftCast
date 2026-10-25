@@ -96,4 +96,19 @@ struct ModelTests {
         #expect(group.name == "Google-Cast-Group-1")
         #expect(group.isGroup)
     }
+
+    @Test func encodesTvAirDateWithWireKey() throws {
+        let metadata = MediaMetadata.tvEpisode(title: "Pilot", seriesTitle: "Show", season: 1, episode: 1, originalAirDate: "2020-01-02")
+        let json = String(decoding: try JSONEncoder().encode(metadata), as: UTF8.self)
+        #expect(json.contains("\"originalAirdate\":\"2020-01-02\""))
+        #expect(!json.contains("originalAirDate"))
+        #expect(try JSONDecoder().decode(MediaMetadata.self, from: Data(json.utf8)) == metadata)
+    }
+
+    @Test(arguments: ["originalAirdate", "originalAirDate"])
+    func decodesTvAirDateSpelling(key: String) throws {
+        let json = #"{"metadataType":2,"\#(key)":"2020-01-02"}"#
+        let metadata = try JSONDecoder().decode(MediaMetadata.self, from: Data(json.utf8))
+        #expect(metadata.originalAirDate == "2020-01-02")
+    }
 }
