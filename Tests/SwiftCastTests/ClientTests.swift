@@ -185,6 +185,30 @@ struct ClientTests {
         }
     }
 
+    @Test func launchErrorPrefersExtendedError() async throws {
+        let replies: [(JSONValue, String)] = [
+            (["type": "LAUNCH_ERROR", "reason": "CANCELLED", "error": "X", "extendedError": "APP_NOT_FOUND"], "APP_NOT_FOUND"),
+            (["type": "LAUNCH_ERROR", "reason": "CANCELLED", "error": "TIMEOUT"], "TIMEOUT"),
+        ]
+        for (reply, reason) in replies {
+            let mock = MockReceiver()
+            mock.on("LAUNCH") { request, mock in mock.reply(to: request, reply) }
+            let client = makeClient(mock)
+            try await client.connect()
+            await #expect(throws: CastError.launchFailed(reason: reason)) {
+                _ = try await client.receiver.launch("BADAPP00")
+            }
+        }
+    }
+
+    @Test func genericErrorIsOnlyMappedOnMediaNamespace() {
+        func message(_ namespace: CastNamespace) -> InboundMessage {
+            InboundMessage(CastMessage(sourceID: "web-5", destinationID: "sender-0", namespace: namespace.rawValue, payload: .string(#"{"type":"ERROR","reason":"NOT_SUPPORTED"}"#)))
+        }
+        #expect(CastClient.standardError(in: message(.media)) == .mediaError(MediaErrorInfo(type: "ERROR", reason: .notSupported)))
+        #expect(CastClient.standardError(in: message(.receiver)) == nil)
+    }
+
     @Test func launchWaitsForLateApplicationStatus() async throws {
         let mock = MockReceiver()
         mock.on("LAUNCH") { request, mock in

@@ -229,7 +229,7 @@ public actor CastClient {
     ) async throws -> InboundMessage {
         guard state == .connected || state == .connecting else { throw CastError.notConnected }
         guard case .object(var object) = try JSONValue(encoding: payload) else {
-            throw CastError.invalidRequest(reason: "Request payload must be a JSON object")
+            throw CastError.invalidRequest(MediaErrorInfo(type: "INVALID_REQUEST", reason: .invalidParams))
         }
         let requestID = nextRequestID
         nextRequestID = nextRequestID == Int32.max ? 1 : nextRequestID + 1
@@ -464,13 +464,15 @@ public actor CastClient {
 
     static func standardError(in message: InboundMessage) -> CastError? {
         guard message.namespace == .receiver || message.namespace == .media, let type = message.type else { return nil }
-        let reason = message.json?["reason"]?.stringValue
         switch type {
-        case "LAUNCH_ERROR": return .launchFailed(reason: reason)
-        case "INVALID_REQUEST": return .invalidRequest(reason: reason)
-        case "LOAD_FAILED": return .loadFailed(reason: reason, detailedErrorCode: message.json?["detailedErrorCode"]?.intValue)
-        case "LOAD_CANCELLED": return .loadCancelled
-        case "INVALID_PLAYER_STATE": return .invalidPlayerState
+        case "LAUNCH_ERROR":
+            let reason = ["extendedError", "error", "reason"].lazy.compactMap { message.json?[$0]?.stringValue }.first
+            return .launchFailed(reason: reason)
+        case "INVALID_REQUEST": return .invalidRequest(MediaErrorInfo(message))
+        case "LOAD_FAILED": return .loadFailed(MediaErrorInfo(message))
+        case "LOAD_CANCELLED": return .loadCancelled(MediaErrorInfo(message))
+        case "INVALID_PLAYER_STATE": return .invalidPlayerState(MediaErrorInfo(message))
+        case "ERROR" where message.namespace == .media: return .mediaError(MediaErrorInfo(message))
         default: return nil
         }
     }

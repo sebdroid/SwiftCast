@@ -219,7 +219,7 @@ public actor MediaController {
     @discardableResult
     public func refreshStatus() async throws -> MediaStatus? {
         let response = try await send(["type": "GET_STATUS"] as JSONValue, timeout: nil)
-        return apply(response)
+        return commit(try parseStatus(response, preferring: status?.mediaSessionId))
     }
 
     /// Stops listening and closes the virtual connection to the application.
@@ -240,8 +240,19 @@ public actor MediaController {
         for (key, value) in fields {
             if let value { object[key] = value }
         }
-        let response = try await send(JSONValue.object(object), timeout: nil)
-        return apply(response)
+        let response: InboundMessage
+        do {
+            response = try await send(JSONValue.object(object), timeout: nil)
+        } catch let error as CastError where error.mediaErrorInfo?.reason == .invalidMediaSessionId {
+            if status?.mediaSessionId == sessionID { update(nil) }
+            throw error
+        }
+        let newStatus = try parseStatus(response, preferring: sessionID)
+        if type == "STOP" {
+            update(nil)
+            return nil
+        }
+        return commit(newStatus)
     }
 
     private func send(_ payload: some Encodable & Sendable, timeout: Duration?) async throws -> InboundMessage {
@@ -250,7 +261,7 @@ public actor MediaController {
     }
 
     private func requireStatus(_ response: InboundMessage) throws -> MediaStatus {
-        guard let status = apply(response) else {
+        guard let status = commit(try parseStatus(response, preferring: nil)) else {
             throw CastError.unexpectedResponse("Media status missing from response")
         }
         return status
@@ -262,15 +273,35 @@ public actor MediaController {
         // late-delivered reply (such as the empty GET_STATUS sent on attach)
         // could overwrite the newer status from a LOAD.
         guard message.type == "MEDIA_STATUS", (message.requestID ?? 0) == 0 else { return }
-        apply(message)
+        // As in Chrome, a broadcast without a usable status leaves the current state alone.
+        let parsed: MediaStatus?
+        do { parsed = try parseStatus(message, preferring: status?.mediaSessionId) } catch { return }
+        commit(parsed)
+    }
+
+    /// `nil` means the receiver has no media session. Throws, without
+    /// touching state, when the message is not a usable `MEDIA_STATUS`.
+    private func parseStatus(_ message: InboundMessage, preferring preferredSessionID: Int?) throws -> MediaStatus? {
+        guard message.type == "MEDIA_STATUS" else {
+            throw CastError.unexpectedResponse("Expected MEDIA_STATUS, got \(message.type ?? "untyped message")")
+        }
+        guard let entries = message.json?["status"]?.arrayValue else {
+            throw CastError.malformedMessage("MEDIA_STATUS has no status list")
+        }
+        guard !entries.isEmpty else { return nil }
+        let decoded = entries.map { try? $0.decode(MediaStatus.self) }
+        if let preferredSessionID, let match = decoded.lazy.compactMap({ $0 }).first(where: { $0.mediaSessionId == preferredSessionID }) {
+            return match
+        }
+        guard let first = decoded[0] else {
+            throw CastError.malformedMessage("Media status entry could not be decoded")
+        }
+        return first
     }
 
     @discardableResult
-    private func apply(_ message: InboundMessage) -> MediaStatus? {
-        guard message.type == "MEDIA_STATUS", let entries = message.json?["status"]?.arrayValue else {
-            return status
-        }
-        guard let first = entries.first, var newStatus = try? first.decode(MediaStatus.self) else {
+    private func commit(_ parsed: MediaStatus?) -> MediaStatus? {
+        guard var newStatus = parsed else {
             update(nil)
             return nil
         }

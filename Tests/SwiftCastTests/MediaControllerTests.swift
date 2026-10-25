@@ -131,15 +131,133 @@ struct MediaControllerTests {
         #expect(await client.isConnected(to: Fixtures.transportID) == false)
     }
 
+    func loadedMedia() async throws -> (MediaController, MockReceiver) {
+        let (client, mock) = try await connectedClient()
+        let media = try await client.launchMediaReceiver()
+        try await media.load(MediaInformation(url: URL(string: "https://example.com/video.mp4")!, contentType: "video/mp4"))
+        return (media, mock)
+    }
+
     @Test func loadFailureIsThrown() async throws {
         let (client, mock) = try await connectedClient()
         mock.on("LOAD") { request, mock in
-            mock.reply(to: request, ["type": "LOAD_FAILED", "detailedErrorCode": 104])
+            mock.reply(to: request, ["type": "LOAD_FAILED", "detailedErrorCode": 104, "reason": "GENERIC_LOAD_ERROR", "itemId": 3])
         }
         let media = try await client.launchMediaReceiver()
-        await #expect(throws: CastError.loadFailed(reason: nil, detailedErrorCode: 104)) {
+        let expected = MediaErrorInfo(type: "LOAD_FAILED", reason: .genericLoadError, detailedErrorCode: 104, itemId: 3)
+        await #expect(throws: CastError.loadFailed(expected)) {
             try await media.load(MediaInformation(url: URL(string: "https://example.com/missing.mp4")!, contentType: "video/mp4"))
         }
+    }
+
+    @Test func genericErrorReplyIsThrown() async throws {
+        let (media, mock) = try await loadedMedia()
+        mock.on("PLAY") { request, mock in
+            mock.reply(to: request, ["type": "ERROR", "reason": "APP_ERROR", "detailedErrorCode": 905, "customData": ["code": "busy"]])
+        }
+        let before = await media.status
+        let expected = MediaErrorInfo(type: "ERROR", reason: .appError, detailedErrorCode: 905, customData: ["code": "busy"])
+        await #expect(throws: CastError.mediaError(expected)) { try await media.play() }
+        #expect(await media.status == before)
+    }
+
+    @Test func invalidPlayerStateCarriesDetails() async throws {
+        let (media, mock) = try await loadedMedia()
+        mock.on("PAUSE") { request, mock in
+            mock.reply(to: request, ["type": "INVALID_PLAYER_STATE", "reason": "INVALID_COMMAND", "customData": ["state": "idle"]])
+        }
+        let error = await #expect(throws: CastError.self) { try await media.pause() }
+        guard case .invalidPlayerState(let info) = error else {
+            Issue.record("Expected invalidPlayerState, got \(String(describing: error))")
+            return
+        }
+        #expect(info.reason == .invalidCommand)
+        #expect(info.customData == ["state": "idle"])
+        #expect(await media.status?.mediaSessionId == 1)
+    }
+
+    @Test func invalidMediaSessionClearsCachedSession() async throws {
+        let (media, mock) = try await loadedMedia()
+        mock.on("PAUSE") { request, mock in
+            mock.reply(to: request, ["type": "INVALID_REQUEST", "reason": "INVALID_MEDIA_SESSION_ID"])
+        }
+        await #expect(throws: CastError.invalidRequest(MediaErrorInfo(type: "INVALID_REQUEST", reason: .invalidMediaSessionId))) {
+            try await media.pause()
+        }
+        #expect(await media.status == nil)
+    }
+
+    @Test func nonStatusReplyIsNotSuccess() async throws {
+        let (media, mock) = try await loadedMedia()
+        mock.on("PLAY") { request, mock in mock.reply(to: request, ["type": "SOMETHING_ELSE"]) }
+        let error = await #expect(throws: CastError.self) { try await media.play() }
+        guard case .unexpectedResponse = error else {
+            Issue.record("Expected unexpectedResponse, got \(String(describing: error))")
+            return
+        }
+        #expect(await media.status?.playerState == .buffering)
+    }
+
+    @Test func stopClearsSession() async throws {
+        for reply in [["type": "MEDIA_STATUS", "status": []], Fixtures.mediaStatus(sessionID: 1, state: "IDLE", includeMedia: false)] as [JSONValue] {
+            let (media, mock) = try await loadedMedia()
+            mock.on("STOP") { request, mock in mock.reply(to: request, reply) }
+            let stopped = try await media.stop()
+            #expect(stopped == nil)
+            #expect(await media.status == nil)
+        }
+    }
+
+    @Test func emptyStatusListMeansNoSession() async throws {
+        let (media, mock) = try await loadedMedia()
+        mock.on("GET_STATUS") { request, mock in mock.reply(to: request, ["type": "MEDIA_STATUS", "status": []]) }
+        #expect(try await media.refreshStatus() == nil)
+        #expect(await media.status == nil)
+    }
+
+    @Test func malformedStatusInReplyThrowsAndKeepsSession() async throws {
+        let (media, mock) = try await loadedMedia()
+        mock.on("PLAY") { request, mock in mock.reply(to: request, ["type": "MEDIA_STATUS", "status": [["bogus": 1]]]) }
+        let error = await #expect(throws: CastError.self) { try await media.play() }
+        guard case .malformedMessage = error else {
+            Issue.record("Expected malformedMessage, got \(String(describing: error))")
+            return
+        }
+        #expect(await media.status?.mediaSessionId == 1)
+    }
+
+    @Test func malformedStatusBroadcastKeepsSession() async throws {
+        let (media, mock) = try await loadedMedia()
+        let updates = await media.statusUpdates()
+        mock.push(["type": "MEDIA_STATUS", "status": [["bogus": 1]]], namespace: .media, from: Fixtures.transportID, to: "*")
+        mock.push(Fixtures.mediaStatus(sessionID: 1, state: "PAUSED", includeMedia: false), namespace: .media, from: Fixtures.transportID, to: "*")
+        var seen: [MediaStatus?] = []
+        for await status in updates {
+            seen.append(status)
+            if status?.playerState == .paused { break }
+        }
+        #expect(!seen.contains(nil))
+        #expect(await media.status?.media?.duration == 596.5)
+    }
+
+    @Test func prefersStatusEntryForCurrentSession() async throws {
+        let (media, mock) = try await loadedMedia()
+        mock.on("PLAY") { request, mock in
+            let other = Fixtures.mediaStatus(sessionID: 2, state: "IDLE")["status"]?.arrayValue ?? []
+            let current = Fixtures.mediaStatus(sessionID: 1, state: "PLAYING", includeMedia: false)["status"]?.arrayValue ?? []
+            mock.reply(to: request, ["type": "MEDIA_STATUS", "status": .array(other + current)])
+        }
+        let status = try #require(try await media.play())
+        #expect(status.mediaSessionId == 1)
+        #expect(status.playerState == .playing)
+    }
+
+    @Test func errorReasonsDecodeOpenly() throws {
+        #expect(MediaErrorReason(rawValue: "DUPLICATE_REQUESTID") == .duplicateRequestId)
+        #expect(MediaErrorReason(rawValue: "DUPLICATE_REQUEST_ID") == .duplicateRequestId)
+        #expect(MediaErrorReason(rawValue: "SOMETHING_NEW") == .unknown("SOMETHING_NEW"))
+        let decoded = try JSONDecoder().decode([MediaErrorReason].self, from: Data(#"["DUPLICATE_REQUESTID","END_OF_QUEUE"]"#.utf8))
+        #expect(decoded == [.duplicateRequestId, .endOfQueue])
     }
 
     @Test func queueAndTrackCommandsEncodeCorrectly() async throws {
