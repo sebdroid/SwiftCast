@@ -9,7 +9,7 @@ struct DiscoveryTests {
         .service(name: name, type: "_googlecast._tcp", domain: "local.", interface: nil)
     }
 
-    private func device(_ txt: [String: String], service name: String = "Chromecast-abc") -> CastDevice? {
+    private func makeDevice(_ txt: [String: String], service name: String = "Chromecast-abc") -> CastDevice? {
         CastDevice(serviceEndpoint: service(name), txt: txt)
     }
 
@@ -26,34 +26,34 @@ struct DiscoveryTests {
         ("xuuid:abc", "xuuid:abc"),
     ])
     func normalisesDeviceID(raw: String, expected: String) throws {
-        let device = try #require(device(["id": raw, "fn": "TV"]))
+        let device = try #require(makeDevice(["id": raw, "fn": "TV"]))
         #expect(device.id == expected)
         #expect(device.txtRecord["id"] == raw)
     }
 
     @Test(arguments: ["", "uuid:", "-", "UUID:--"])
     func dropsRecordsWithEmptyID(raw: String) {
-        #expect(device(["id": raw, "fn": "TV"]) == nil)
+        #expect(makeDevice(["id": raw, "fn": "TV"]) == nil)
     }
 
     @Test func fallsBackToServiceNameWithoutIDOrName() throws {
-        let missing = try #require(device(["ca": "5"], service: "Google-Cast-Group-1"))
+        let missing = try #require(makeDevice(["ca": "5"], service: "Google-Cast-Group-1"))
         #expect(missing.id == "Google-Cast-Group-1")
         #expect(missing.name == "Google-Cast-Group-1")
-        let empty = try #require(device(["id": "abc", "fn": ""], service: "Chromecast-xyz"))
+        let empty = try #require(makeDevice(["id": "abc", "fn": ""], service: "Chromecast-xyz"))
         #expect(empty.name == "Chromecast-xyz")
     }
 
     @Test func parsesCapabilitiesAsUnsigned() throws {
-        #expect(try #require(device(["ca": "-1"])).capabilities == [])
-        #expect(try #require(device(["ca": "lots"])).capabilities == [])
-        #expect(try #require(device([:])).capabilities == [])
+        #expect(try #require(makeDevice(["ca": "-1"])).capabilities == [])
+        #expect(try #require(makeDevice(["ca": "lots"])).capabilities == [])
+        #expect(try #require(makeDevice([:])).capabilities == [])
 
-        let caps = try #require(device(["ca": "4101"])).capabilities
+        let caps = try #require(makeDevice(["ca": "4101"])).capabilities
         #expect(caps == [.videoOut, .audioOut, .attenuationOrFixedVolume])
         #expect(caps.rawValue == 4101)
 
-        let wide = try #require(device(["ca": "18446744073709551615"])).capabilities
+        let wide = try #require(makeDevice(["ca": "18446744073709551615"])).capabilities
         #expect(wide.rawValue == .max)
     }
 
@@ -69,7 +69,7 @@ struct DiscoveryTests {
     }
 
     @Test func parsesStatusVersionAppAndIcon() throws {
-        let device = try #require(device([
+        let device = try #require(makeDevice([
             "id": "abc", "ve": "05", "st": "1", "rr": "CC1AD845", "ic": "/setup/icon.png", "rs": "Default Media Receiver",
         ]))
         #expect(device.deviceVersion == 5)
@@ -78,11 +78,11 @@ struct DiscoveryTests {
         #expect(device.iconPath == "/setup/icon.png")
         #expect(device.statusText == "Default Media Receiver")
 
-        #expect(self.device(["st": "0"])?.status == .idle)
-        #expect(self.device(["st": "2"])?.status == nil)
-        #expect(self.device(["st": "busy"])?.status == nil)
+        #expect(makeDevice(["st": "0"])?.status == .idle)
+        #expect(makeDevice(["st": "2"])?.status == nil)
+        #expect(makeDevice(["st": "busy"])?.status == nil)
 
-        let bare = try #require(self.device(["ve": "", "rr": "", "ic": ""]))
+        let bare = try #require(makeDevice(["ve": "", "rr": "", "ic": ""]))
         #expect(bare.deviceVersion == nil)
         #expect(bare.status == nil)
         #expect(bare.runningApplicationID == nil)
