@@ -148,10 +148,26 @@ struct DiscoveryTests {
 
         let afterLoss = CastDiscovery.devices(from: [candidate("B"), candidate("A")], keeping: &chosen)
         #expect(afterLoss.map(\.name) == ["A"])
-        #expect(chosen == ["abc": service("A")])
+        #expect(chosen == ["abc": service("Real"), "def": service("X")])
 
         let returned = CastDiscovery.devices(from: [candidate("Real"), candidate("A")], keeping: &chosen)
-        #expect(returned.map(\.name) == ["A"])
+        #expect(returned.map(\.name) == ["Real"])
+    }
+
+    @Test func aMissedCallbackDoesNotHandTheIDToALookalike() {
+        func candidate(_ serviceName: String) -> CastDiscovery.BrowseCandidate {
+            .init(device: device(id: "X", name: serviceName, service: serviceName), interfaceTypes: [.wifi], interfaceNames: ["en0"])
+        }
+        var chosen: [String: NWEndpoint] = [:]
+        let first = CastDiscovery.devices(from: [candidate("Living-Room")], keeping: &chosen)
+        #expect(first.map(\.endpoint) == [service("Living-Room")])
+
+        let missed = CastDiscovery.devices(from: [candidate("0")], keeping: &chosen)
+        #expect(missed.map(\.endpoint) == [service("0")])
+        #expect(chosen == ["X": service("Living-Room")])
+
+        let both = CastDiscovery.devices(from: [candidate("0"), candidate("Living-Room")], keeping: &chosen)
+        #expect(both.map(\.endpoint) == [service("Living-Room")])
     }
 
     @Test func sortsByNameThenID() {

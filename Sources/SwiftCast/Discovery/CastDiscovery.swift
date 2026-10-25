@@ -139,10 +139,11 @@ public enum CastDiscovery {
     }
 
     /// The same device can be reported once per network interface, or under
-    /// several service names, so one result per `id` is kept. The endpoint
-    /// kept last time wins while it is still reported, so a newcomer copying
-    /// a known device's `id` cannot displace it; otherwise a fixed rule picks.
-    /// `chosen` is updated to the endpoints kept this time.
+    /// several service names, so one result per `id` is kept. The first
+    /// endpoint kept for an `id` wins whenever it is reported, so a newcomer
+    /// copying a known device's `id` cannot displace it; otherwise a fixed
+    /// rule picks. `chosen` records only the first pick per `id`, so a
+    /// device keeps its claim through callbacks that briefly miss it.
     static func devices(from candidates: [BrowseCandidate], keeping chosen: inout [String: NWEndpoint]) -> [CastDevice] {
         var byID: [String: BrowseCandidate] = [:]
         for candidate in candidates {
@@ -159,7 +160,9 @@ public enum CastDiscovery {
             }
             byID[id] = candidate
         }
-        chosen = byID.mapValues(\.device.endpoint)
+        for (id, candidate) in byID where chosen[id] == nil {
+            chosen[id] = candidate.device.endpoint
+        }
         return sorted(byID.values.map(\.device))
     }
 
