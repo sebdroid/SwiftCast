@@ -30,8 +30,14 @@ public struct ReceiverController: Sendable {
     /// never complete a launch, since they can describe an older instance of
     /// the application.
     ///
-    /// Only one launch may be pending per client at a time; a second call
-    /// meanwhile throws ``CastError/requestInFlight(_:)``. If the application
+    /// Only one launch may be pending per client at a time. A call for the
+    /// same application meanwhile joins the pending launch instead of sending
+    /// another `LAUNCH`: it shares that launch's reply, timeout and result,
+    /// and its own `timeout` and `onStatus` are ignored, so only the first
+    /// caller sees `LAUNCH_STATUS` updates. Cancelling the first caller
+    /// cancels the launch for every caller; cancelling a joined caller only
+    /// makes that call throw `CancellationError`. A call for a different
+    /// application meanwhile throws ``CastError/requestInFlight(_:)``. If the application
     /// is already running it is relaunched by the receiver; use
     /// ``CastClient/launchMediaApp(_:)`` to join instead.
     ///
@@ -43,6 +49,16 @@ public struct ReceiverController: Sendable {
         _ appID: CastAppID,
         timeout: Duration = ReceiverController.defaultLaunchTimeout,
         onStatus: (@Sendable (String) -> Void)? = nil
+    ) async throws -> CastApplication {
+        try await client.coalescedLaunch(appID) {
+            try await sendLaunch(appID, timeout: timeout, onStatus: onStatus)
+        }
+    }
+
+    private func sendLaunch(
+        _ appID: CastAppID,
+        timeout: Duration,
+        onStatus: (@Sendable (String) -> Void)?
     ) async throws -> CastApplication {
         let options = CastClient.RequestOptions(exclusive: true, acceptsLaunchRequestID: true) { message in
             guard message.type == "LAUNCH_STATUS" else { return true }
