@@ -14,39 +14,72 @@ public struct ReceiverController: Sendable {
         return try decodeStatus(response)
     }
 
+    /// How long ``launch(_:timeout:onStatus:)`` waits by default.
+    public static let defaultLaunchTimeout: Duration = .seconds(60)
+    /// The longest a launch waits; longer timeouts are clamped to this.
+    public static let maximumLaunchTimeout: Duration = .seconds(120)
+
     /// Launches an application and returns it once it is running.
     ///
-    /// If the application is already running it is relaunched by the
-    /// receiver; use ``CastClient/launchMediaApp(_:)`` to join instead.
-    public func launch(_ appID: CastAppID, timeout: Duration = .seconds(30)) async throws -> CastApplication {
-        // Subscribe before sending so a status broadcast that races the
-        // response is not missed.
-        let updates = await client.receiverStatusUpdates()
-        let response = try await client.request(LaunchRequest(appId: appID), namespace: .receiver, to: destination, timeout: timeout)
-        if let app = try decodeStatus(response).application(appID) {
-            return app
+    /// The launch completes when the receiver answers it with a
+    /// `RECEIVER_STATUS` listing the application, or fails with a
+    /// `LAUNCH_ERROR` (see ``CastError/launchErrorReason``). While the device
+    /// waits for the user to allow the launch it sends `LAUNCH_STATUS`
+    /// updates such as `USER_PENDING_AUTHORIZATION`, which are passed to
+    /// `onStatus` and keep the launch waiting. Unsolicited status broadcasts
+    /// never complete a launch, since they can describe an older instance of
+    /// the application.
+    ///
+    /// Only one launch may be pending per client at a time; a second call
+    /// meanwhile throws ``CastError/requestInFlight(_:)``. If the application
+    /// is already running it is relaunched by the receiver; use
+    /// ``CastClient/launchMediaApp(_:)`` to join instead.
+    ///
+    /// - Parameters:
+    ///   - timeout: How long to wait for the whole launch, at most ``maximumLaunchTimeout``.
+    ///   - onStatus: Called on the client's actor with the `status` of each
+    ///     `LAUNCH_STATUS` update, so it should return quickly.
+    public func launch(
+        _ appID: CastAppID,
+        timeout: Duration = ReceiverController.defaultLaunchTimeout,
+        onStatus: (@Sendable (String) -> Void)? = nil
+    ) async throws -> CastApplication {
+        let options = CastClient.RequestOptions(exclusive: true, acceptsLaunchRequestID: true) { message in
+            guard message.type == "LAUNCH_STATUS" else { return true }
+            if let status = message.json?["status"]?.stringValue { onStatus?(status) }
+            return false
         }
-        // Some receivers answer before the app has finished launching.
-        return try await withThrowingTaskGroup(of: CastApplication.self) { group in
-            group.addTask {
-                for await status in updates {
-                    if let app = status.application(appID) { return app }
-                }
-                throw CastError.notConnected
-            }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                throw CastError.launchFailed(reason: "Timed out waiting for application to start")
-            }
-            defer { group.cancelAll() }
-            return try await group.next()!
+        let response = try await client.request(
+            LaunchRequest(appId: appID),
+            namespace: .receiver,
+            to: destination,
+            timeout: Self.clampedLaunchTimeout(timeout),
+            options: options
+        )
+        let status = try decodeStatus(response)
+        guard let app = status.applications?.first(where: { $0.appId == appID && $0.transportId != CastEndpoint.platformReceiver }) else {
+            throw CastError.launchFailed(reason: "application not listed after launch")
         }
+        return app
+    }
+
+    static func clampedLaunchTimeout(_ timeout: Duration) -> Duration {
+        min(timeout, maximumLaunchTimeout)
     }
 
     /// Stops a running application session.
+    ///
+    /// Only one stop may be pending per client at a time; a second call
+    /// meanwhile throws ``CastError/requestInFlight(_:)``.
     @discardableResult
     public func stop(sessionID: String) async throws -> ReceiverStatus {
-        let response = try await client.request(StopRequest(sessionId: sessionID), namespace: .receiver, to: destination)
+        let response = try await client.request(
+            StopRequest(sessionId: sessionID),
+            namespace: .receiver,
+            to: destination,
+            timeout: nil,
+            options: CastClient.RequestOptions(exclusive: true)
+        )
         return try decodeStatus(response)
     }
 
@@ -89,8 +122,7 @@ public struct ReceiverController: Sendable {
         guard message.type == "RECEIVER_STATUS", let json = message.json?["status"] else {
             throw CastError.unexpectedResponse(message.type ?? "untyped message")
         }
-        let status = try json.decode(ReceiverStatus.self)
-        return status
+        return try json.decode(ReceiverStatus.self)
     }
 
     private struct Request: Encodable, Sendable { let type: String }

@@ -88,6 +88,19 @@ public actor CastClient {
     private struct PendingRequest {
         let continuation: CheckedContinuation<InboundMessage, any Error>
         let timeoutTask: Task<Void, Never>
+        let type: String?
+        let options: RequestOptions
+    }
+
+    /// How a request is correlated with its replies and when it completes.
+    struct RequestOptions: Sendable {
+        /// Only one request of this payload's `type` may be pending per
+        /// namespace and destination at a time.
+        var exclusive = false
+        /// Replies may echo the id as `launchRequestId` instead of `requestId`.
+        var acceptsLaunchRequestID = false
+        /// Whether a correlated reply completes the request.
+        var isFinal: @Sendable (InboundMessage) -> Bool = { _ in true }
     }
 
     private let makeTransport: @Sendable () -> any CastTransport
@@ -271,18 +284,36 @@ public actor CastClient {
 
     /// Sends a JSON request and waits for the response carrying the same `requestId`.
     ///
+    /// Only a reply on `namespace` from `destination` answers the request.
+    /// `until` decides whether such a reply completes it: a reply it rejects
+    /// is an intermediate update, still delivered through ``messages(in:)``,
+    /// and the request stays pending until a later reply is accepted or
+    /// `timeout` passes. The timeout covers the whole exchange, not each reply.
+    ///
     /// Standard Cast error responses (`LAUNCH_ERROR`, `LOAD_FAILED`,
     /// `INVALID_REQUEST`, …) are thrown as ``CastError``.
     public func request(
         _ payload: some Encodable & Sendable,
         namespace: CastNamespace,
         to destination: String,
-        timeout: Duration? = nil
+        timeout: Duration? = nil,
+        until isFinal: @escaping @Sendable (InboundMessage) -> Bool = { _ in true }
+    ) async throws -> InboundMessage {
+        try await request(payload, namespace: namespace, to: destination, timeout: timeout, options: RequestOptions(isFinal: isFinal))
+    }
+
+    func request(
+        _ payload: some Encodable & Sendable,
+        namespace: CastNamespace,
+        to destination: String,
+        timeout: Duration?,
+        options: RequestOptions
     ) async throws -> InboundMessage {
         guard state == .connected || state == .connecting else { throw CastError.notConnected }
         guard case .object(var object) = try JSONValue(encoding: payload) else {
             throw CastError.invalidPayload("Request payload must be a JSON object")
         }
+        let type = object["type"]?.stringValue
         let requestID = nextRequestID
         nextRequestID = nextRequestID == Int32.max ? 1 : nextRequestID + 1
         let key = PendingKey(namespace: namespace, destination: destination, requestID: requestID)
@@ -292,12 +323,17 @@ public actor CastClient {
 
         let response = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<InboundMessage, any Error>) in
+                // Checked here, where registration happens, so two callers cannot both pass.
+                if options.exclusive, let type, isPending(type, namespace: namespace, destination: destination) {
+                    continuation.resume(throwing: CastError.requestInFlight(type))
+                    return
+                }
                 let timeoutTask = Task { [weak self] in
                     try? await Task.sleep(for: timeout)
                     guard !Task.isCancelled else { return }
                     await self?.resolve(key, with: .failure(CastError.timeout))
                 }
-                pending[key] = PendingRequest(continuation: continuation, timeoutTask: timeoutTask)
+                pending[key] = PendingRequest(continuation: continuation, timeoutTask: timeoutTask, type: type, options: options)
                 if Task.isCancelled {
                     // The cancellation handler may have run before registration.
                     resolve(key, with: .failure(CancellationError()))
@@ -488,6 +524,23 @@ public actor CastClient {
         stateBroadcaster.yield(newState)
     }
 
+    private func isPending(_ type: String, namespace: CastNamespace, destination: String) -> Bool {
+        pending.contains { $0.key.namespace == namespace && $0.key.destination == destination && $0.value.type == type }
+    }
+
+    /// Completes the pending request a reply answers, unless its completion
+    /// rule treats the reply as an intermediate update.
+    private func correlate(_ message: InboundMessage) {
+        for case let (id?, isLaunchEcho) in [(message.requestID, false), (message.launchRequestID, true)] where id != 0 {
+            let key = PendingKey(namespace: message.namespace, destination: message.sourceID, requestID: id)
+            guard let request = pending[key], !isLaunchEcho || request.options.acceptsLaunchRequestID else { continue }
+            if request.options.isFinal(message) {
+                resolve(key, with: .success(message))
+            }
+            return
+        }
+    }
+
     private func resolve(_ key: PendingKey, with result: Result<InboundMessage, any Error>) {
         guard let request = pending.removeValue(forKey: key) else { return }
         request.timeoutTask.cancel()
@@ -541,9 +594,7 @@ public actor CastClient {
             break
         }
 
-        if let requestID = message.requestID, requestID != 0 {
-            resolve(PendingKey(namespace: message.namespace, destination: message.sourceID, requestID: requestID), with: .success(message))
-        }
+        correlate(message)
         messageBroadcaster.yield(message)
     }
 

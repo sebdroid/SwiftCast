@@ -97,10 +97,11 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         continuation.yield(try! FrameCodec.frame(message))
     }
 
-    /// Replies to a request, echoing its `requestId`.
-    func reply(to request: InboundMessage, _ json: JSONValue) {
+    /// Replies to a request, echoing its `requestId` under `idKey`, such as
+    /// `launchRequestId`, or under no key when `idKey` is `nil`.
+    func reply(to request: InboundMessage, _ json: JSONValue, echoingIDAs idKey: String? = "requestId") {
         var object = json.objectValue ?? [:]
-        if let id = request.requestID { object["requestId"] = .number(Double(id)) }
+        if let idKey, let id = request.requestID { object[idKey] = .number(Double(id)) }
         push(.object(object), namespace: request.namespace, from: request.destinationID, to: request.sourceID)
     }
 

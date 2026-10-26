@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Testing
 @testable import SwiftCast
 
@@ -474,17 +475,214 @@ struct ClientTests {
         #expect(CastClient.standardError(in: message(.receiver)) == nil)
     }
 
-    @Test func launchWaitsForLateApplicationStatus() async throws {
+    // MARK: - Launch lifecycle
+
+    static func appJSON(_ appID: String = "CC1AD845", sessionID: String, transportID: String) -> JSONValue {
+        ["appId": .string(appID), "displayName": "App", "sessionId": .string(sessionID), "transportId": .string(transportID)]
+    }
+
+    @Test func launchRequestIDAcceptsOnlyInt32() {
+        func message(_ json: String) -> InboundMessage {
+            InboundMessage(CastMessage(sourceID: "receiver-0", destinationID: "sender-0", namespace: CastNamespace.receiver.rawValue, payload: .string(json)))
+        }
+        #expect(message(#"{"launchRequestId":2147483647}"#).launchRequestID == 2147483647)
+        #expect(message(#"{"launchRequestId":2147483648}"#).launchRequestID == nil)
+        #expect(message(#"{"launchRequestId":1.5}"#).launchRequestID == nil)
+        #expect(message(#"{"launchRequestId":"7"}"#).launchRequestID == nil)
+        #expect(message(#"{"requestId":7}"#).launchRequestID == nil)
+        #expect(message(#"{"launchRequestId":7}"#).requestID == nil)
+    }
+
+    @Test func launchStaysPendingThroughLaunchStatus() async throws {
         let mock = MockReceiver()
         mock.on("LAUNCH") { request, mock in
-            // Reply without the app, then broadcast once it has started.
-            mock.reply(to: request, Fixtures.receiverStatus())
+            mock.reply(to: request, ["type": "LAUNCH_STATUS", "status": "USER_PENDING_AUTHORIZATION"], echoingIDAs: "launchRequestId")
+            mock.reply(to: request, ["type": "LAUNCH_STATUS", "status": "USER_ALLOWED"])
+            mock.reply(to: request, Fixtures.receiverStatus(apps: [Fixtures.mediaApp]))
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        let statuses = OSAllocatedUnfairLock<[String]>(initialState: [])
+        let app = try await client.receiver.launch(.defaultMediaReceiver) { status in
+            statuses.withLock { $0.append(status) }
+        }
+        #expect(app.transportId == Fixtures.transportID)
+        #expect(statuses.withLock { $0 } == ["USER_PENDING_AUTHORIZATION", "USER_ALLOWED"])
+    }
+
+    @Test func launchErrorEchoedAsLaunchRequestIDFailsTheLaunch() async throws {
+        let mock = MockReceiver()
+        mock.on("LAUNCH") { request, mock in
+            mock.reply(to: request, ["type": "LAUNCH_ERROR", "extendedError": "NOTIFICATION_DISABLED"], echoingIDAs: "launchRequestId")
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        let error = await #expect(throws: CastError.self) { _ = try await client.receiver.launch(.defaultMediaReceiver) }
+        #expect(error?.launchErrorReason == .notificationDisabled)
+    }
+
+    @Test func launchRequestIDDoesNotAnswerOtherRequests() async throws {
+        let mock = MockReceiver()
+        mock.on("GET_STATUS") { request, mock in
+            mock.reply(to: request, Fixtures.receiverStatus(), echoingIDAs: "launchRequestId")
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        await #expect(throws: CastError.timeout) {
+            _ = try await client.request(["type": "GET_STATUS"] as JSONValue, namespace: .receiver, to: "receiver-0", timeout: .milliseconds(200))
+        }
+    }
+
+    @Test func launchStatusAloneTimesOutOnce() async throws {
+        let mock = MockReceiver()
+        mock.on("LAUNCH") { request, mock in
+            mock.reply(to: request, ["type": "LAUNCH_STATUS", "status": "USER_PENDING_AUTHORIZATION"], echoingIDAs: "launchRequestId")
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        let start = ContinuousClock.now
+        await #expect(throws: CastError.timeout) {
+            _ = try await client.receiver.launch(.defaultMediaReceiver, timeout: .milliseconds(300))
+        }
+        let elapsed = ContinuousClock.now - start
+        #expect(elapsed >= .milliseconds(300))
+        #expect(elapsed < .milliseconds(600))
+    }
+
+    @Test func launchErrorUserNotAllowedIsTyped() async throws {
+        let mock = MockReceiver()
+        mock.on("LAUNCH") { request, mock in
+            mock.reply(to: request, ["type": "LAUNCH_ERROR", "reason": "CANCELLED", "extendedError": "USER_NOT_ALLOWED"])
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        let error = await #expect(throws: CastError.self) { _ = try await client.receiver.launch(.defaultMediaReceiver) }
+        #expect(error == .launchFailed(reason: "USER_NOT_ALLOWED"))
+        #expect(error?.launchErrorReason == .userNotAllowed)
+    }
+
+    @Test func launchErrorReasonDecodesDocumentedCodes() {
+        #expect(CastError.launchFailed(reason: "USER_NOT_ALLOWED").launchErrorReason == .userNotAllowed)
+        #expect(CastError.launchFailed(reason: "NOTIFICATION_DISABLED").launchErrorReason == .notificationDisabled)
+        #expect(CastError.launchFailed(reason: "NOT_FOUND").launchErrorReason == .unknown("NOT_FOUND"))
+        #expect(CastError.launchFailed(reason: nil).launchErrorReason == nil)
+        #expect(CastError.timeout.launchErrorReason == nil)
+    }
+
+    @Test func replyWithoutTheAppFailsWithoutWaitingForBroadcasts() async throws {
+        let mock = MockReceiver()
+        mock.on("LAUNCH") { request, mock in
+            mock.reply(to: request, Fixtures.receiverStatus(apps: [Self.appJSON("E8C28D3C", sessionID: "old-backdrop", transportID: "web-1")]))
             mock.push(Fixtures.receiverStatus(apps: [Fixtures.mediaApp]), namespace: .receiver, to: "*")
         }
         let client = makeClient(mock)
         try await client.connect()
+        let start = ContinuousClock.now
+        await #expect(throws: CastError.launchFailed(reason: "application not listed after launch")) {
+            _ = try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10))
+        }
+        #expect(ContinuousClock.now - start < .seconds(2))
+    }
+
+    @Test func applicationOnThePlatformTransportIsNotALaunchedApp() async throws {
+        let mock = MockReceiver()
+        mock.on("LAUNCH") { request, mock in
+            mock.reply(to: request, Fixtures.receiverStatus(apps: [Self.appJSON(sessionID: "s-1", transportID: "receiver-0")]))
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        await #expect(throws: CastError.launchFailed(reason: "application not listed after launch")) {
+            _ = try await client.receiver.launch(.defaultMediaReceiver)
+        }
+    }
+
+    @Test func staleBroadcastNeverCompletesLaunch() async throws {
+        let mock = MockReceiver()
+        mock.on("LAUNCH") { _, mock in
+            mock.push(Fixtures.receiverStatus(apps: [Self.appJSON(sessionID: "stale", transportID: "web-1")]), namespace: .receiver, to: "*")
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        await #expect(throws: CastError.timeout) {
+            _ = try await client.receiver.launch(.defaultMediaReceiver, timeout: .milliseconds(300))
+        }
+        #expect(await client.receiverStatus?.application(.defaultMediaReceiver)?.sessionId == "stale")
+    }
+
+    @Test func launchReturnsTheInstanceFromItsOwnReply() async throws {
+        let mock = MockReceiver()
+        mock.on("LAUNCH") { request, mock in
+            mock.push(Fixtures.receiverStatus(apps: [Self.appJSON(sessionID: "stale", transportID: "web-1")]), namespace: .receiver, to: "*")
+            mock.reply(to: request, Fixtures.receiverStatus(apps: [Self.appJSON(sessionID: "fresh", transportID: "web-2")]))
+        }
+        let client = makeClient(mock)
+        try await client.connect()
         let app = try await client.receiver.launch(.defaultMediaReceiver)
+        #expect(app.sessionId == "fresh")
+        #expect(app.transportId == "web-2")
+    }
+
+    @Test func concurrentLaunchThrowsRequestInFlight() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let first = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
+        await #expect(throws: CastError.requestInFlight("LAUNCH")) {
+            _ = try await client.receiver.launch(.youTube)
+        }
+        let launch = try #require(mock.sentMessages(ofType: "LAUNCH").first)
+        mock.reply(to: launch, Fixtures.receiverStatus(apps: [Fixtures.mediaApp]))
+        let app = try await first.value
         #expect(app.transportId == Fixtures.transportID)
+        #expect(mock.sentMessages(ofType: "LAUNCH").count == 1)
+        Fixtures.installDefaultReceiver(on: mock)
+        _ = try await client.receiver.launch(.defaultMediaReceiver)
+    }
+
+    @Test func stopWhileStopPendingThrowsRequestInFlight() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let first = Task { try await client.receiver.stop(sessionID: Fixtures.sessionID) }
+        try await eventually { mock.sentMessages(ofType: "STOP").count == 1 }
+        await #expect(throws: CastError.requestInFlight("STOP")) {
+            try await client.receiver.stop(sessionID: "another")
+        }
+        // Other receiver requests are not serialised behind it.
+        Fixtures.installDefaultReceiver(on: mock)
+        _ = try await client.receiver.getStatus()
+        let stop = try #require(mock.sentMessages(ofType: "STOP").first)
+        mock.reply(to: stop, Fixtures.receiverStatus())
+        _ = try await first.value
+        #expect(mock.sentMessages(ofType: "STOP").count == 1)
+    }
+
+    @Test func requestInFlightDescription() {
+        #expect(CastError.requestInFlight("LAUNCH").errorDescription == "A LAUNCH request is already in flight.")
+    }
+
+    @Test func launchTimeoutDefaultsAndClamp() {
+        #expect(ReceiverController.defaultLaunchTimeout == .seconds(60))
+        #expect(ReceiverController.maximumLaunchTimeout == .seconds(120))
+        #expect(ReceiverController.clampedLaunchTimeout(.seconds(60)) == .seconds(60))
+        #expect(ReceiverController.clampedLaunchTimeout(.seconds(120)) == .seconds(120))
+        #expect(ReceiverController.clampedLaunchTimeout(.seconds(600)) == .seconds(120))
+        #expect(ReceiverController.clampedLaunchTimeout(.milliseconds(200)) == .milliseconds(200))
+    }
+
+    @Test func customRequestCanWaitPastIntermediateReplies() async throws {
+        let mock = MockReceiver()
+        let custom = CastNamespace("urn:x-cast:com.example.custom")
+        mock.on("work") { request, mock in
+            mock.reply(to: request, ["type": "progress"])
+            mock.reply(to: request, ["type": "done"])
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        try await client.openVirtualConnection(to: "web-1")
+        let reply = try await client.request(["type": "work"] as JSONValue, namespace: custom, to: "web-1") { $0.type != "progress" }
+        #expect(reply.type == "done")
     }
 
     @Test func customNamespaceMessaging() async throws {
