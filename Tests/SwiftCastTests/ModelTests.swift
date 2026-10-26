@@ -66,6 +66,40 @@ struct ModelTests {
         #expect(status.estimatedTime(after: 3) == 10)
     }
 
+    @Test func statusEntryCarriesPositionForwardWhenCurrentTimeIsMissing() throws {
+        var cached = MediaStatus(mediaSessionId: 1, playerState: .playing, currentTime: 10, playbackRate: 2)
+        cached.media = MediaInformation(contentId: "x", contentType: "video/mp4", duration: 100)
+        let volumeOnly: JSONValue = ["mediaSessionId": 1, "volume": ["level": 0.5]]
+        let entry = try volumeOnly.decode(MediaStatusEntry.self)
+        let merged = entry.applied(to: cached, elapsed: 3)
+        #expect(merged.currentTime == 16)
+        #expect(merged.playerState == .playing)
+        #expect(merged.volume?.level == 0.5)
+        #expect(merged.media == cached.media)
+
+        let timed: JSONValue = ["mediaSessionId": 1, "currentTime": 50]
+        let timedEntry = try timed.decode(MediaStatusEntry.self)
+        #expect(timedEntry.applied(to: cached, elapsed: 3).currentTime == 50)
+    }
+
+    @Test func nonStringPlayerStateDecodesLeniently() throws {
+        let fresh: JSONValue = ["mediaSessionId": 4, "playerState": 7, "currentTime": 3]
+        let status = try fresh.decode(MediaStatus.self)
+        #expect(status.playerState == .idle)
+        #expect(status.currentTime == 3)
+
+        let cached = MediaStatus(mediaSessionId: 4, playerState: .paused, currentTime: 3)
+        let invalid: JSONValue = ["mediaSessionId": 4, "playerState": ["x": 1], "currentTime": 8]
+        let invalidEntry = try invalid.decode(MediaStatusEntry.self)
+        let kept = invalidEntry.applied(to: cached, elapsed: 0)
+        #expect(kept.playerState == .paused)
+        #expect(kept.currentTime == 8)
+
+        let unknown: JSONValue = ["mediaSessionId": 4, "playerState": "SCRUBBING"]
+        let unknownEntry = try unknown.decode(MediaStatusEntry.self)
+        #expect(unknownEntry.applied(to: cached, elapsed: 0).playerState == .unknown("SCRUBBING"))
+    }
+
     @Test func jsonValueLiteralsAndAccessors() throws {
         let value: JSONValue = ["a": [1, 2.5, "x", true, nil], "b": ["c": "d"]]
         #expect(value["a"]?.arrayValue?.count == 5)
@@ -140,5 +174,37 @@ struct ModelTests {
         #expect(group.id == "Google-Cast-Group-1")
         #expect(group.name == "Google-Cast-Group-1")
         #expect(group.isGroup)
+    }
+
+    @Test func errorDescriptionsDropControlAndFormatScalars() {
+        let hostile = "BAD\u{1B}[31m\u{202E}REASON\u{2028}\u{07}"
+        let launch = CastError.launchFailed(reason: hostile)
+        #expect(launch.errorDescription == "Failed to launch app: BAD[31mREASON")
+        let media = CastError.loadFailed(MediaErrorInfo(type: "LOAD_FAILED", reason: .unknown(hostile), detailedErrorCode: 104))
+        #expect(media.errorDescription == "Media failed to load: BAD[31mREASON (code 104)")
+        let response = CastError.unexpectedResponse("Expected MEDIA_STATUS, got \u{1B}]0;x\u{07}OOPS")
+        #expect(response.errorDescription == "Unexpected response: Expected MEDIA_STATUS, got ]0;xOOPS")
+    }
+
+    @Test func errorDescriptionsKeepOrdinaryText() {
+        let launch = CastError.launchFailed(reason: "App not found, try again")
+        #expect(launch.errorDescription == "Failed to launch app: App not found, try again")
+        let media = CastError.loadFailed(MediaErrorInfo(type: "LOAD_FAILED", reason: .unknown("CUSTOM_REASON")))
+        #expect(media.errorDescription == "Media failed to load: CUSTOM_REASON")
+    }
+
+    @Test func errorDescriptionsDropInvisibleFormatScalars() {
+        let launch = CastError.launchFailed(reason: "Den\u{200E}\u{2066}TV\u{FEFF}\u{2029}")
+        #expect(launch.errorDescription == "Failed to launch app: DenTV")
+    }
+
+    @Test func displaySanitizedKeepsZeroWidthJoinerSequences() {
+        let text = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"
+        #expect(Array(text.displaySanitized.unicodeScalars) == Array(text.unicodeScalars))
+    }
+
+    @Test func displaySanitizedKeepsZeroWidthNonJoiner() {
+        let text = "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}"
+        #expect(Array(text.displaySanitized.unicodeScalars) == Array(text.unicodeScalars))
     }
 }

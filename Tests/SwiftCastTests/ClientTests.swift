@@ -61,6 +61,17 @@ struct ClientTests {
         #expect(await client.state == .connected)
     }
 
+    @Test func nonObjectPayloadIsRejectedLocally() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let sentBefore = mock.sentMessages.count
+        await #expect(throws: CastError.invalidPayload("Request payload must be a JSON object")) {
+            _ = try await client.request(["GET_STATUS"] as JSONValue, namespace: .receiver, to: "receiver-0")
+        }
+        #expect(mock.sentMessages.count == sentBefore)
+    }
+
     @Test func requestIsCancellable() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
@@ -201,6 +212,30 @@ struct ClientTests {
         await #expect(throws: CastError.launchFailed(reason: "NOT_FOUND")) {
             _ = try await client.receiver.launch("BADAPP00")
         }
+    }
+
+    @Test func launchErrorPrefersExtendedError() async throws {
+        let replies: [(JSONValue, String)] = [
+            (["type": "LAUNCH_ERROR", "reason": "CANCELLED", "error": "X", "extendedError": "APP_NOT_FOUND"], "APP_NOT_FOUND"),
+            (["type": "LAUNCH_ERROR", "reason": "CANCELLED", "error": "TIMEOUT"], "TIMEOUT"),
+        ]
+        for (reply, reason) in replies {
+            let mock = MockReceiver()
+            mock.on("LAUNCH") { request, mock in mock.reply(to: request, reply) }
+            let client = makeClient(mock)
+            try await client.connect()
+            await #expect(throws: CastError.launchFailed(reason: reason)) {
+                _ = try await client.receiver.launch("BADAPP00")
+            }
+        }
+    }
+
+    @Test func genericErrorIsOnlyMappedOnMediaNamespace() {
+        func message(_ namespace: CastNamespace) -> InboundMessage {
+            InboundMessage(CastMessage(sourceID: "web-5", destinationID: "sender-0", namespace: namespace.rawValue, payload: .string(#"{"type":"ERROR","reason":"NOT_SUPPORTED"}"#)))
+        }
+        #expect(CastClient.standardError(in: message(.media)) == .mediaError(MediaErrorInfo(type: "ERROR", reason: .notSupported)))
+        #expect(CastClient.standardError(in: message(.receiver)) == nil)
     }
 
     @Test func launchWaitsForLateApplicationStatus() async throws {
