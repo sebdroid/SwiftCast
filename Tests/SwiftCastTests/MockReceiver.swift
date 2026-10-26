@@ -122,15 +122,19 @@ enum Fixtures {
     static let transportID = "web-5"
     static let sessionID = "8F9D1A2B-0000-4E1F-B6C1-6D4B9C1A5E77"
 
-    static let mediaApp: JSONValue = [
-        "appId": "CC1AD845",
-        "displayName": "Default Media Receiver",
-        "sessionId": .string(sessionID),
-        "transportId": .string(transportID),
-        "statusText": "Ready To Cast",
-        "isIdleScreen": false,
-        "namespaces": [["name": "urn:x-cast:com.google.cast.media"], ["name": "urn:x-cast:com.google.cast.cac"]],
-    ]
+    static let mediaApp = mediaApp(sessionID: sessionID)
+
+    static func mediaApp(sessionID: String) -> JSONValue {
+        [
+            "appId": "CC1AD845",
+            "displayName": "Default Media Receiver",
+            "sessionId": .string(sessionID),
+            "transportId": .string(transportID),
+            "statusText": "Ready To Cast",
+            "isIdleScreen": false,
+            "namespaces": [["name": "urn:x-cast:com.google.cast.media"], ["name": "urn:x-cast:com.google.cast.cac"]],
+        ]
+    }
 
     static func receiverStatus(apps: [JSONValue] = [], level: Double = 0.5) -> JSONValue {
         var status: [String: JSONValue] = ["volume": ["level": .number(level), "muted": false, "controlType": "attenuation", "stepInterval": 0.05]]
@@ -159,13 +163,21 @@ enum Fixtures {
         return ["type": "MEDIA_STATUS", "status": [.object(status)]]
     }
 
-    /// Installs handlers that emulate a device running the Default Media Receiver.
-    static func installDefaultReceiver(on mock: MockReceiver, appRunning: Bool = false) {
+    /// Installs handlers that emulate a device running the Default Media
+    /// Receiver. Set the returned flag to start or stop the app without a
+    /// status broadcast.
+    @discardableResult
+    static func installDefaultReceiver(
+        on mock: MockReceiver,
+        appRunning: Bool = false,
+        sessionID: String = sessionID
+    ) -> OSAllocatedUnfairLock<Bool> {
         let running = OSAllocatedUnfairLock(initialState: appRunning)
+        let app = mediaApp(sessionID: sessionID)
         let mediaSession = OSAllocatedUnfairLock(initialState: 0)
         mock.on("GET_STATUS") { request, mock in
             if request.namespace == .receiver {
-                mock.reply(to: request, receiverStatus(apps: running.withLock { $0 } ? [mediaApp] : []))
+                mock.reply(to: request, receiverStatus(apps: running.withLock { $0 } ? [app] : []))
             } else if request.namespace == .media {
                 let id = mediaSession.withLock { $0 }
                 mock.reply(to: request, id == 0 ? ["type": "MEDIA_STATUS", "status": []] : mediaStatus(sessionID: id, includeMedia: true))
@@ -173,7 +185,7 @@ enum Fixtures {
         }
         mock.on("LAUNCH") { request, mock in
             running.withLock { $0 = true }
-            mock.reply(to: request, receiverStatus(apps: [mediaApp]))
+            mock.reply(to: request, receiverStatus(apps: [app]))
         }
         mock.on("LOAD") { request, mock in
             let id = mediaSession.withLock { $0 += 1; return $0 }
@@ -188,5 +200,6 @@ enum Fixtures {
         mock.on("SEEK") { request, mock in
             mock.reply(to: request, mediaStatus(sessionID: mediaSession.withLock { $0 }, state: "PLAYING", time: request.json?["currentTime"]?.doubleValue ?? 0, includeMedia: false))
         }
+        return running
     }
 }
