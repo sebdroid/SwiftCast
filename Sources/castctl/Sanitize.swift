@@ -1,7 +1,8 @@
 extension String {
-    /// Removes control scalars, line or paragraph separators and invisible or direction-changing
-    /// format scalars so device-supplied text can't inject terminal escapes or reorder the output.
-    /// Spaces are kept.
+    /// Removes control scalars, line or paragraph separators, the bidi control characters and
+    /// the invisible operator scalars listed below, so device-supplied text can't inject terminal
+    /// escapes or reorder the output. Other format scalars (soft hyphen, zero width space, tag
+    /// characters used by subdivision flags) and spaces are kept.
     func sanitized() -> String {
         String(String.UnicodeScalarView(unicodeScalars.filter { scalar in
             switch scalar.properties.generalCategory {
