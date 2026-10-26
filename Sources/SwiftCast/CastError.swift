@@ -10,8 +10,10 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
     case heartbeatTimeout
     /// A request did not receive a response in time.
     case timeout
-    /// Bytes received from the device could not be decoded.
+    /// A message could not be framed for sending or decoded after receipt.
     case malformedMessage(String)
+    /// An outbound message body of the given byte count exceeds the Cast frame limit.
+    case messageTooLarge(Int)
     /// The receiver refused to launch an application.
     case launchFailed(reason: String?)
     /// A request payload was rejected locally, before anything was sent.
@@ -42,6 +44,7 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
         case .heartbeatTimeout: "The Cast device stopped responding."
         case .timeout: "The Cast device did not respond in time."
         case .malformedMessage(let message): "Malformed message: \(message.displaySanitized)"
+        case .messageTooLarge(let byteCount): "Message body of \(byteCount) bytes exceeds the \(FrameCodec.maximumOutboundBodyLength) byte limit"
         case .launchFailed(let reason): "Failed to launch app\(reason.map { ": \($0.displaySanitized)" } ?? ".")"
         case .invalidPayload(let message): "Invalid payload: \(message.displaySanitized)"
         case .invalidRequest(let info): "Invalid request\(Self.suffix(info))"

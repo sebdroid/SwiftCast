@@ -110,6 +110,51 @@ struct ModelTests {
         #expect(try JSONDecoder().decode(JSONValue.self, from: data) == value)
     }
 
+    @Test func intValueRejectsValuesOutsideInt() {
+        #expect(JSONValue.number(42.0).intValue == 42)
+        #expect(JSONValue.number(-0.0).intValue == 0)
+        #expect(JSONValue.number(9223372036854775808.0).intValue == nil)
+        #expect(JSONValue.number(Double(Int.max)).intValue == nil)
+        #expect(JSONValue.number(-9223372036854775808.0).intValue == Int.min)
+        #expect(JSONValue.number(1e19).intValue == nil)
+        #expect(JSONValue.number(-1e19).intValue == nil)
+        #expect(JSONValue.number(0.5).intValue == nil)
+        #expect(JSONValue.number(.nan).intValue == nil)
+        #expect(JSONValue.number(.infinity).intValue == nil)
+        #expect(JSONValue.number(-.infinity).intValue == nil)
+        #expect(JSONValue.string("1").intValue == nil)
+    }
+
+    @Test func intValueOfDecodedHugeIntegersDoesNotTrap() throws {
+        for literal in ["9223372036854775807", "9223372036854775808", "-9223372036854777856", "18446744073709551616"] {
+            let value = try JSONDecoder().decode(JSONValue.self, from: Data(literal.utf8))
+            #expect(value.intValue == nil, "\(literal)")
+        }
+    }
+
+    func inbound(_ json: String) -> InboundMessage {
+        InboundMessage(CastMessage(sourceID: "receiver-0", destinationID: "sender-0", namespace: CastNamespace.receiver.rawValue, payload: .string(json)))
+    }
+
+    @Test func requestIDAcceptsOnlyInt32() {
+        #expect(inbound(#"{"requestId":2147483647}"#).requestID == 2147483647)
+        #expect(inbound(#"{"requestId":-2147483648}"#).requestID == -2147483648)
+        #expect(inbound(#"{"requestId":2147483648}"#).requestID == nil)
+        #expect(inbound(#"{"requestId":-2147483649}"#).requestID == nil)
+        #expect(inbound(#"{"requestId":9223372036854775808}"#).requestID == nil)
+        #expect(inbound(#"{"requestId":1.5}"#).requestID == nil)
+        #expect(inbound(#"{"requestId":"7"}"#).requestID == nil)
+        #expect(inbound(#"{"requestId":0}"#).requestID == 0)
+    }
+
+    @Test func requestIDMissingIsNil() {
+        #expect(inbound(#"{"type":"RECEIVER_STATUS"}"#).requestID == nil)
+        #expect(inbound(#"[1,2,3]"#).requestID == nil)
+        #expect(inbound("not json").requestID == nil)
+        let binary = InboundMessage(CastMessage(sourceID: "a", destinationID: "b", namespace: "ns", payload: .binary(Data([1, 2]))))
+        #expect(binary.requestID == nil)
+    }
+
     @Test func parsesDeviceTXTRecord() {
         let device = CastDevice(
             serviceEndpoint: .service(name: "Chromecast-abc", type: "_googlecast._tcp", domain: "local.", interface: nil),

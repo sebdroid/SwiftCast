@@ -91,8 +91,9 @@ extension CastMessage {
 
     /// Parses a message from its protobuf wire representation.
     ///
-    /// Unknown fields are skipped. Missing required fields throw
-    /// ``CastError/malformedMessage(_:)``.
+    /// Unknown fields are skipped. Messages Chromium's `IsCastMessageValid`
+    /// rejects (missing or empty required fields, a payload type without its
+    /// matching payload field) throw ``CastError/malformedMessage(_:)``.
     public init(serializedData data: Data) throws {
         var reader = ByteReader(data)
         var protocolVersion: Int?
@@ -106,6 +107,9 @@ extension CastMessage {
         while !reader.isAtEnd {
             let key = try reader.readVarint()
             let field = key >> 3
+            guard field != 0 else {
+                throw CastError.malformedMessage("Invalid field number 0")
+            }
             guard let wire = WireType(rawValue: UInt8(key & 0x7)) else {
                 throw CastError.malformedMessage("Unsupported wire type \(key & 0x7)")
             }
@@ -124,11 +128,19 @@ extension CastMessage {
         guard let protocolVersion, let source, let destination, let namespace, let payloadType else {
             throw CastError.malformedMessage("Missing required CastMessage field")
         }
+        guard !source.isEmpty else { throw CastError.malformedMessage("Empty source_id") }
+        guard !destination.isEmpty else { throw CastError.malformedMessage("Empty destination_id") }
+        guard !namespace.isEmpty else { throw CastError.malformedMessage("Empty namespace") }
         let payload: Payload
         switch payloadType {
-        case 0: payload = .string(utf8 ?? "")
-        case 1: payload = .binary(binary ?? Data())
-        default: throw CastError.malformedMessage("Unknown payload type \(payloadType)")
+        case 0:
+            guard let utf8 else { throw CastError.malformedMessage("STRING message without payload_utf8") }
+            payload = .string(utf8)
+        case 1:
+            guard let binary else { throw CastError.malformedMessage("BINARY message without payload_binary") }
+            payload = .binary(binary)
+        default:
+            throw CastError.malformedMessage("Unknown payload type \(payloadType)")
         }
         self.init(
             protocolVersion: protocolVersion,
