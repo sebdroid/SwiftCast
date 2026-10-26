@@ -287,6 +287,32 @@ struct DiscoveryTests {
     }
 
     @MainActor
+    @Test func browserExpiresTheOldRosterWhenARestartReportsNothing() async throws {
+        let (firstStream, firstContinuation) = AsyncStream.makeStream(of: CastDiscovery.Event.self)
+        let (secondStream, secondContinuation) = AsyncStream.makeStream(of: CastDiscovery.Event.self)
+        let streams = OSAllocatedUnfairLock(initialState: [firstStream, secondStream])
+        let browser = CastDeviceBrowser(gracePeriod: .seconds(1), sweepInterval: .milliseconds(20)) { _ in
+            streams.withLock { $0.removeFirst() }
+        }
+
+        let first = Task { await browser.run() }
+        firstContinuation.yield(.devices([device(id: "a", name: "A"), device(id: "b", name: "B")]))
+        try await waitUntil { browser.devices.count == 2 }
+        first.cancel()
+        await first.value
+
+        let second = Task { await browser.run() }
+        defer { second.cancel() }
+        secondContinuation.yield(.waiting("blocked"))
+        try await waitUntil { browser.devices.isEmpty }
+        #expect(browser.problem == "blocked")
+
+        secondContinuation.yield(.devices([device(id: "a", name: "A")]))
+        try await waitUntil { browser.devices.map(\.id) == ["a"] }
+        #expect(browser.problem == nil)
+    }
+
+    @MainActor
     private func waitUntil(timeout: Duration = .seconds(5), _ condition: () -> Bool) async throws {
         let deadline = ContinuousClock.now + timeout
         while !condition() {
