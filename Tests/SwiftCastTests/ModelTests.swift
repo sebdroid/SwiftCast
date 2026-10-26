@@ -19,6 +19,76 @@ struct ModelTests {
         #expect(status.application(.backdrop)?.displayName == "Backdrop")
     }
 
+    @Test func receiverStatusDropsPlatformTransportButKeepsLenientFields() throws {
+        let json = """
+        {"applications":[
+          {"appId":"CC1AD845","displayName":"Default Media Receiver","sessionId":"s1","transportId":"t1","namespaces":[{"name":"urn:x-cast:com.google.cast.media"},{"bogus":1}],
+           "appType":"WEB","senderApps":[{"packageId":"x"}],"appImages":[{"url":"https://x/i.png"}]},
+          {"appId":"ABCDEF12","displayName":"Impostor","sessionId":"s3","transportId":"receiver-0"}
+        ],"volume":{"controlType":"attenuation","level":0.5,"muted":false},"isStandBy":"nope","isActiveInput":true}
+        """
+        let status = try JSONDecoder().decode(ReceiverStatus.self, from: Data(json.utf8))
+        let apps = try #require(status.applications)
+        #expect(apps.count == 1)
+        let app = try #require(apps.first)
+        #expect(app.appId == .defaultMediaReceiver)
+        #expect(app.supports(.media))
+        #expect(app.namespaces?.count == 1)
+        #expect(app.appType == "WEB")
+        #expect(app.senderApps?.first?["packageId"]?.stringValue == "x")
+        #expect(app.appImages?.first?.url == URL(string: "https://x/i.png"))
+        #expect(status.volume?.level == 0.5)
+        #expect(status.isActiveInput == true)
+        #expect(status.isStandBy == nil)
+    }
+
+    @Test(arguments: [
+        #"{"applications":[{"appId":"CC1AD845","sessionId":"s1","transportId":"t1"},{"appId":"233637DE","displayName":"YouTube","sessionId":"s2"}]}"#,
+        #"{"applications":[{"appId":"CC1AD845","sessionId":"","transportId":"t1"}]}"#,
+        #"{"applications":[{"appId":"CC1AD845","sessionId":"s1","transportId":""}]}"#,
+        #"{"applications":[{"appId":"CC1AD845","sessionId":"s1","transportId":"t1"},{"appId":"ABCDEF12","sessionId":"","transportId":"receiver-0"}]}"#,
+        #"{"applications":{"appId":"CC1AD845","sessionId":"s1","transportId":"t1"},"volume":{"level":0.5}}"#,
+    ])
+    func receiverStatusWithIncompleteApplicationsFailsToDecode(json: String) {
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(ReceiverStatus.self, from: Data(json.utf8))
+        }
+    }
+
+    @Test func receiverStatusWithoutApplicationsDecodes() throws {
+        let status = try JSONDecoder().decode(ReceiverStatus.self, from: Data(#"{"volume":{"level":0.5}}"#.utf8))
+        #expect(status.applications == nil)
+        #expect(status.volume?.level == 0.5)
+    }
+
+    @Test func applicationWithUnexpectedNamespacesShapeDecodesWithNone() throws {
+        let json = #"{"appId":"CC1AD845","sessionId":"s1","transportId":"t1","namespaces":"urn:x-cast:com.google.cast.media"}"#
+        let app = try JSONDecoder().decode(CastApplication.self, from: Data(json.utf8))
+        #expect(app.namespaces == [])
+        #expect(!app.supports(.media))
+    }
+
+    @Test func volumeControlTypeIsOpen() throws {
+        let weird = try JSONDecoder().decode(CastVolume.self, from: Data(#"{"controlType":"weird","level":1}"#.utf8))
+        #expect(weird.controlType == .unknown("weird"))
+        #expect(weird.canSetVolume)
+
+        let fixed = try JSONDecoder().decode(CastVolume.self, from: Data(#"{"controlType":"fixed"}"#.utf8))
+        #expect(fixed.controlType == .fixed)
+        #expect(!fixed.canSetVolume)
+
+        #expect(CastVolume().canSetVolume)
+        #expect(try JSONValue(encoding: CastVolume(controlType: .master))["controlType"]?.stringValue == "master")
+    }
+
+    @Test func volumeWithBadFieldKeepsTheRest() throws {
+        let volume = try JSONDecoder().decode(CastVolume.self, from: Data(#"{"level":0.25,"muted":"yes","controlType":3,"stepInterval":0.05}"#.utf8))
+        #expect(volume.level == 0.25)
+        #expect(volume.muted == nil)
+        #expect(volume.controlType == nil)
+        #expect(volume.stepInterval == 0.05)
+    }
+
     @Test func decodesMediaStatusWithTracksAndUnknownEnums() throws {
         let json = """
         {"mediaSessionId":3,"playbackRate":1,"playerState":"PLAYING","currentTime":12.5,"supportedMediaCommands":274447,
