@@ -143,7 +143,147 @@ struct ClientTests {
         try await client.connect()
         mock.push(["type": "CLOSE"], namespace: .connection)
         try await eventually { await client.state != .connected }
-        #expect(await client.state == .closed(.connectionFailed("Connection closed by device")))
+        #expect(await client.state == .closed(.closedByReceiver))
+    }
+
+    @Test func applicationCloseOnlyDropsThatConnection() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        mock.push(["type": "CLOSE"], namespace: .connection, from: Fixtures.transportID)
+        try await eventually { await !client.isConnected(to: Fixtures.transportID) }
+        #expect(await client.state == .connected)
+    }
+
+    @Test func defaultSenderIDIsUniquePerClient() {
+        let first = makeClient(MockReceiver())
+        let second = makeClient(MockReceiver())
+        #expect(first.senderID.hasPrefix("sender-"))
+        #expect(first.senderID != "sender-0")
+        #expect(first.senderID == first.senderID.lowercased())
+        #expect(UUID(uuidString: String(first.senderID.dropFirst("sender-".count))) != nil)
+        #expect(first.senderID != second.senderID)
+    }
+
+    @Test func messagesUseTheClientSenderID() async throws {
+        let mock = MockReceiver()
+        let client = CastClient(senderID: "sender-custom") { mock }
+        try await client.connect()
+        mock.push(["type": "PING"], namespace: .heartbeat)
+        try await eventually { mock.sentMessages(ofType: "PONG").count == 1 }
+        let connect = try #require(mock.sentMessages(ofType: "CONNECT").first)
+        let pong = try #require(mock.sentMessages(ofType: "PONG").first)
+        #expect(connect.sourceID == "sender-custom")
+        #expect(pong.sourceID == "sender-custom")
+        #expect(pong.destinationID == "receiver-0")
+    }
+
+    @Test func connectPayloadDescribesThisSender() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock) { $0.userAgent = "TestApp/2.0" }
+        try await client.connect()
+        let connect = try #require(mock.sentMessages(ofType: "CONNECT").first)
+        let rawPayload = try #require(connect.raw.stringPayload)
+        let payload = try #require(connect.json?.objectValue)
+        let senderInfo = try #require(payload["senderInfo"]?.objectValue)
+
+        #expect(Set(payload.keys) == ["type", "userAgent", "origin", "connType", "protocolVersion", "protocolVersionList", "senderInfo"])
+        #expect(payload["userAgent"] == "TestApp/2.0")
+        #expect(payload["origin"] == [:])
+        #expect(payload["connType"] == 0)
+        #expect(payload["protocolVersion"] == 0)
+        #expect(payload["protocolVersionList"] == [0])
+
+        #expect(Set(senderInfo.keys) == ["sdkType", "version", "browserVersion", "platform", "systemVersion", "connectionType"])
+        #expect(senderInfo["sdkType"] == 2)
+        #expect(senderInfo["version"] == .string(CastClient.version))
+        #expect(senderInfo["browserVersion"] == .string(CastClient.version))
+        #expect(senderInfo["systemVersion"] == .string(ProcessInfo.processInfo.operatingSystemVersionString))
+        #expect(senderInfo["connectionType"] == 1)
+        #if os(iOS) || os(tvOS) || os(visionOS)
+        #expect(senderInfo["platform"] == 2)
+        #elseif os(macOS)
+        #expect(senderInfo["platform"] == 4)
+        #else
+        #expect(senderInfo["platform"] == 0)
+        #endif
+
+        #expect(!rawPayload.contains("15.605.1.3"))
+        #expect(!rawPayload.contains("44.0.2403.30"))
+    }
+
+    @Test func defaultUserAgentNamesSwiftCastAndTheOS() {
+        let userAgent = CastClient.Configuration().userAgent
+        #expect(userAgent.hasPrefix("SwiftCast/\(CastClient.version) ("))
+        #expect(userAgent.hasSuffix(")"))
+    }
+
+    @Test func applicationConnectUsesConfiguredConnectionType() async throws {
+        for (type, expected) in [(CastClient.ConnectionType.strong, JSONValue(0)), (.invisible, JSONValue(2))] {
+            let mock = MockReceiver()
+            let client = makeClient(mock) { $0.applicationConnectionType = type }
+            try await client.connect()
+            try await client.openVirtualConnection(to: Fixtures.transportID)
+            let connects = mock.sentMessages(ofType: "CONNECT")
+            let platformConnect = connects.first { $0.destinationID == "receiver-0" }
+            let applicationConnect = connects.first { $0.destinationID == Fixtures.transportID }
+            let platform = try #require(platformConnect)
+            let application = try #require(applicationConnect)
+            #expect(platform.json?["connType"] == 0)
+            #expect(application.json?["connType"] == expected)
+        }
+    }
+
+    @Test func connectedRecordsNegotiatedProtocolVersion() async throws {
+        let mock = MockReceiver()
+        mock.on("CONNECT") { request, mock in
+            mock.push(["type": "CONNECTED", "protocolVersion": 0], namespace: .connection, from: request.destinationID, to: request.sourceID)
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        mock.push(["type": "CONNECTED", "protocolVersion": 1], namespace: .connection, from: Fixtures.transportID)
+        try await eventually { await client.negotiatedProtocolVersion(for: Fixtures.transportID) == 1 }
+        #expect(await client.negotiatedProtocolVersion(for: "receiver-0") == 0)
+        #expect(await client.state == .connected)
+
+        await client.closeVirtualConnection(to: Fixtures.transportID)
+        #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == nil)
+    }
+
+    @Test func connectDoesNotWaitForConnected() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        #expect(await client.isConnected(to: Fixtures.transportID))
+        #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == nil)
+    }
+
+    @Test func unknownConnectionMessagesAreIgnored() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.push(["type": "SOMETHING_NEW"], namespace: .connection)
+        mock.push(Fixtures.receiverStatus(level: 0.3), namespace: .receiver, to: "*")
+        try await eventually { await client.receiverStatus?.volume?.level == 0.3 }
+        #expect(await client.state == .connected)
+        #expect(await client.isConnected(to: "receiver-0"))
+    }
+
+    @Test func closeCarriesGracefulReasonCode() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        await client.closeVirtualConnection(to: Fixtures.transportID)
+        await client.disconnect()
+        let closes = mock.sentMessages(ofType: "CLOSE")
+        #expect(closes.map(\.destinationID) == [Fixtures.transportID, "receiver-0"])
+        for close in closes {
+            #expect(close.json == ["type": "CLOSE", "reasonCode": 5])
+        }
     }
 
     @Test func malformedFrameClosesConnection() async throws {
