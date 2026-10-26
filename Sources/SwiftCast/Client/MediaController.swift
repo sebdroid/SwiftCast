@@ -292,7 +292,9 @@ public actor MediaController {
         // late-delivered reply (such as the empty GET_STATUS sent on attach)
         // could overwrite the newer status from a LOAD.
         guard message.type == "MEDIA_STATUS", (message.requestID ?? 0) == 0 else { return }
-        // As in Chrome, a broadcast without a usable status leaves the current state alone.
+        // As in Chrome, a broadcast that cannot be parsed leaves the current
+        // state alone. An empty status list does clear it: that is how a
+        // receiver reports that no media session is left.
         let parsed: MediaStatusEntry?
         do { parsed = try parseStatus(message) } catch { return }
         commit(parsed)

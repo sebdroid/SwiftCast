@@ -82,6 +82,24 @@ struct ModelTests {
         #expect(timedEntry.applied(to: cached, elapsed: 3).currentTime == 50)
     }
 
+    @Test func nonStringPlayerStateDecodesLeniently() throws {
+        let fresh: JSONValue = ["mediaSessionId": 4, "playerState": 7, "currentTime": 3]
+        let status = try fresh.decode(MediaStatus.self)
+        #expect(status.playerState == .idle)
+        #expect(status.currentTime == 3)
+
+        let cached = MediaStatus(mediaSessionId: 4, playerState: .paused, currentTime: 3)
+        let invalid: JSONValue = ["mediaSessionId": 4, "playerState": ["x": 1], "currentTime": 8]
+        let invalidEntry = try invalid.decode(MediaStatusEntry.self)
+        let kept = invalidEntry.applied(to: cached, elapsed: 0)
+        #expect(kept.playerState == .paused)
+        #expect(kept.currentTime == 8)
+
+        let unknown: JSONValue = ["mediaSessionId": 4, "playerState": "SCRUBBING"]
+        let unknownEntry = try unknown.decode(MediaStatusEntry.self)
+        #expect(unknownEntry.applied(to: cached, elapsed: 0).playerState == .unknown("SCRUBBING"))
+    }
+
     @Test func jsonValueLiteralsAndAccessors() throws {
         let value: JSONValue = ["a": [1, 2.5, "x", true, nil], "b": ["c": "d"]]
         #expect(value["a"]?.arrayValue?.count == 5)

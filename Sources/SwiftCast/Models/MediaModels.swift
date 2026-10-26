@@ -584,7 +584,7 @@ public struct MediaStatus: Codable, Sendable, Hashable {
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         mediaSessionId = try c.decode(Int.self, forKey: .mediaSessionId)
-        playerState = try c.decodeIfPresent(PlayerState.self, forKey: .playerState) ?? .idle
+        playerState = (try? c.decodeIfPresent(PlayerState.self, forKey: .playerState)) ?? .idle
         playbackRate = try? c.decodeIfPresent(Double.self, forKey: .playbackRate)
         idleReason = try? c.decodeIfPresent(IdleReason.self, forKey: .idleReason)
         currentTime = try? c.decodeIfPresent(Double.self, forKey: .currentTime)
@@ -628,6 +628,8 @@ struct MediaStatusEntry: Decodable, Sendable {
     init(from decoder: any Decoder) throws {
         status = try MediaStatus(from: decoder)
         let c = try decoder.container(keyedBy: MediaStatus.CodingKeys.self)
+        // An unrecognised string still counts as present and is applied as
+        // `.unknown`; only a missing, `null` or non-string value keeps the cached state.
         includesPlayerState = (try? c.decodeIfPresent(PlayerState.self, forKey: .playerState)) != nil
     }
 
