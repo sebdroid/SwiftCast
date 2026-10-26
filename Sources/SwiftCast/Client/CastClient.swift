@@ -97,6 +97,7 @@ public actor CastClient {
     private var pending: [PendingKey: PendingRequest] = [:]
     private var nextRequestID = 1
     private var connectedDestinations: Set<String> = []
+    private var connectsInFlight: [String: Task<Void, any Error>] = [:]
     private var protocolVersions: [String: Int] = [:]
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
@@ -156,6 +157,7 @@ public actor CastClient {
         setState(.connecting)
         decoder = FrameDecoder()
         connectedDestinations = []
+        connectsInFlight = [:]
         protocolVersions = [:]
 
         let transport = makeTransport()
@@ -322,14 +324,24 @@ public actor CastClient {
     // MARK: - Virtual connections
 
     /// Opens a virtual connection to `destination` (e.g. an app's `transportId`).
-    /// Does nothing if one is already open.
+    /// Does nothing if one is already open. A call made while another is still
+    /// opening the same connection waits for it and shares its result.
     public func openVirtualConnection(to destination: String) async throws {
+        if let inFlight = connectsInFlight[destination] {
+            return try await inFlight.value
+        }
         guard !connectedDestinations.contains(destination) else { return }
         // Registered before the write so a message the peer sends as soon as
         // it sees CONNECT is not dropped as coming from an unknown peer.
         connectedDestinations.insert(destination)
+        let payload = connectPayload(to: destination)
+        let write = Task { try await sendJSON(payload, namespace: .connection, to: destination) }
+        connectsInFlight[destination] = write
+        defer {
+            if connectsInFlight[destination] == write { connectsInFlight[destination] = nil }
+        }
         do {
-            try await sendJSON(connectPayload(to: destination), namespace: .connection, to: destination)
+            try await write.value
         } catch {
             connectedDestinations.remove(destination)
             throw error
@@ -626,6 +638,7 @@ public actor CastClient {
         transport?.close()
         transport = nil
         connectedDestinations = []
+        connectsInFlight = [:]
         protocolVersions = [:]
         let failures = pending
         pending = [:]

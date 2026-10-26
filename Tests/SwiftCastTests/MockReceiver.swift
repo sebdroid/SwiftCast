@@ -12,6 +12,8 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         var handlers: [String: Handler] = [:]
         var openError: CastError?
         var sendFailures: [String: CastError] = [:]
+        var heldTypes: Set<String> = []
+        var heldSends: [CheckedContinuation<Void, Never>] = []
         var isOpen = false
         var clientID: String?
     }
@@ -48,6 +50,21 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         state.withLock { $0.sendFailures[type] = error }
     }
 
+    /// Makes sends of messages of the given `type` wait, after being
+    /// recorded, until ``releaseHeldSends()`` is called.
+    func holdSends(ofType type: String) {
+        state.withLock { _ = $0.heldTypes.insert(type) }
+    }
+
+    func releaseHeldSends() {
+        let held = state.withLock { state in
+            state.heldTypes = []
+            defer { state.heldSends = [] }
+            return state.heldSends
+        }
+        for continuation in held { continuation.resume() }
+    }
+
     // MARK: CastTransport
 
     func open() async throws {
@@ -59,10 +76,21 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         let output = state.withLock { $0.decoder.append(data) }
         for message in output.messages {
             let inbound = InboundMessage(message)
-            let (handler, failure) = state.withLock { state -> (Handler?, CastError?) in
+            let (handler, failure, held) = state.withLock { state -> (Handler?, CastError?, Bool) in
                 state.sent.append(inbound)
                 if state.clientID == nil { state.clientID = inbound.sourceID }
-                return (inbound.type.flatMap { state.handlers[$0] }, inbound.type.flatMap { state.sendFailures[$0] })
+                let type = inbound.type ?? ""
+                return (state.handlers[type], state.sendFailures[type], state.heldTypes.contains(type))
+            }
+            if held {
+                await withCheckedContinuation { continuation in
+                    let stillHeld = state.withLock { state in
+                        guard state.heldTypes.contains(inbound.type ?? "") else { return false }
+                        state.heldSends.append(continuation)
+                        return true
+                    }
+                    if !stillHeld { continuation.resume() }
+                }
             }
             if let failure { throw failure }
             if inbound.namespace == .heartbeat, inbound.type == "PING", answersPings {
