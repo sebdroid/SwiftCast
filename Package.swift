@@ -25,7 +25,7 @@ let package = Package(
         ),
         .testTarget(
             name: "SwiftCastTests",
-            dependencies: ["SwiftCast"]
+            dependencies: ["SwiftCast", "castctl"]
         ),
     ],
     swiftLanguageModes: [.v6]
