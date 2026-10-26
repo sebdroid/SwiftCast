@@ -15,6 +15,16 @@ public actor MediaController {
     public private(set) var statusDate: Date?
     /// `true` once the application session has ended or the connection was lost.
     public private(set) var isClosed = false
+    /// `true` while ``status`` describes a media session that accepts
+    /// commands. It turns `false` once a ``stop()`` reply arrives or the
+    /// receiver rejects the session id, even though ``status`` may still hold
+    /// the final `IDLE` status for display. While it is `false`, playback,
+    /// volume, track and queue commands throw ``CastError/noMediaSession``
+    /// without contacting the receiver. Loading media, or a status for a
+    /// different media session, makes it `true` again.
+    public var hasActiveSession: Bool { status != nil && !sessionEnded }
+
+    private var sessionEnded = false
 
     private let statusBroadcaster = Broadcaster<MediaStatus?>()
     private var listenTask: Task<Void, Never>?
@@ -133,10 +143,13 @@ public actor MediaController {
 
     /// Stops playback and unloads the media. The receiver normally answers
     /// with an `IDLE` status for the stopped session, which is kept so a UI
-    /// can go on showing what was playing.
+    /// can go on showing what was playing. The stopped session no longer
+    /// takes commands, so later session commands throw
+    /// ``CastError/noMediaSession`` until new media is loaded; see
+    /// ``hasActiveSession``.
     @discardableResult
     public func stop() async throws -> MediaStatus? {
-        try await sessionCommand("STOP")
+        try await sessionCommand("STOP", endsSession: true)
     }
 
     /// Seeks to an absolute position in seconds.
@@ -236,8 +249,8 @@ public actor MediaController {
 
     // MARK: - Private
 
-    private func sessionCommand(_ type: String, _ fields: [String: JSONValue?] = [:]) async throws -> MediaStatus? {
-        guard let sessionID = status?.mediaSessionId else { throw CastError.noMediaSession }
+    private func sessionCommand(_ type: String, _ fields: [String: JSONValue?] = [:], endsSession: Bool = false) async throws -> MediaStatus? {
+        guard !sessionEnded, let sessionID = status?.mediaSessionId else { throw CastError.noMediaSession }
         var object: [String: JSONValue] = ["type": .string(type), "mediaSessionId": .number(Double(sessionID))]
         for (key, value) in fields {
             if let value { object[key] = value }
@@ -246,10 +259,17 @@ public actor MediaController {
         do {
             response = try await send(JSONValue.object(object), timeout: nil)
         } catch let error as CastError where error.mediaErrorInfo?.reason == .invalidMediaSessionId {
-            if status?.mediaSessionId == sessionID { update(nil) }
+            if status?.mediaSessionId == sessionID {
+                update(nil)
+                sessionEnded = true
+            }
             throw error
         }
-        return commit(try parseStatus(response))
+        let committed = commit(try parseStatus(response))
+        // The media messages spec invalidates the mediaSessionId on STOP, so
+        // commands sent with it afterwards could only fail on the receiver.
+        if endsSession { sessionEnded = true }
+        return committed
     }
 
     private func send(_ payload: some Encodable & Sendable, timeout: Duration?) async throws -> InboundMessage {
@@ -298,7 +318,8 @@ public actor MediaController {
 
     /// Applies an entry onto the cached status of the same media session.
     /// A different session, or `replacing`, starts from the entry alone so
-    /// nothing of the previous session's media or queue survives.
+    /// nothing of the previous session's media or queue survives, and is
+    /// treated as a live session again.
     @discardableResult
     private func commit(_ entry: MediaStatusEntry?, replacing: Bool = false) -> MediaStatus? {
         guard let entry else {
@@ -311,6 +332,7 @@ public actor MediaController {
             newStatus = entry.applied(to: cached, elapsed: elapsed)
         } else {
             newStatus = entry.status
+            sessionEnded = false
         }
         update(newStatus)
         return newStatus

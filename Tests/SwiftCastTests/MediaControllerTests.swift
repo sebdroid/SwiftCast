@@ -185,6 +185,22 @@ struct MediaControllerTests {
             try await media.pause()
         }
         #expect(await media.status == nil)
+        #expect(await media.hasActiveSession == false)
+    }
+
+    @Test func invalidMediaSessionEndsSessionUntilNextLoad() async throws {
+        let (media, mock) = try await loadedMedia()
+        mock.on("PAUSE") { request, mock in
+            mock.reply(to: request, ["type": "INVALID_REQUEST", "reason": "INVALID_MEDIA_SESSION_ID"])
+        }
+        await #expect(throws: CastError.self) { try await media.pause() }
+        await #expect(throws: CastError.noMediaSession) { try await media.play() }
+        #expect(mock.sentMessages(ofType: "PLAY").isEmpty)
+
+        try await media.load(MediaInformation(url: URL(string: "https://example.com/video.mp4")!, contentType: "video/mp4"))
+        #expect(await media.hasActiveSession)
+        try await media.play()
+        #expect(mock.sentMessages(ofType: "PLAY").count == 1)
     }
 
     @Test func nonStatusReplyIsNotSuccess() async throws {
@@ -215,6 +231,65 @@ struct MediaControllerTests {
         let stopped = try await media.stop()
         #expect(stopped == nil)
         #expect(await media.status == nil)
+        #expect(await media.hasActiveSession == false)
+    }
+
+    func stoppedMedia() async throws -> (MediaController, MockReceiver) {
+        let (media, mock) = try await loadedMedia()
+        mock.on("STOP") { request, mock in
+            mock.reply(to: request, Fixtures.mediaStatus(sessionID: 1, state: "IDLE", time: 12, includeMedia: false))
+        }
+        try await media.stop()
+        return (media, mock)
+    }
+
+    @Test func commandsAfterStopFailWithoutSending() async throws {
+        let (media, mock) = try await stoppedMedia()
+        #expect(await media.hasActiveSession == false)
+        await #expect(throws: CastError.noMediaSession) { try await media.play() }
+        await #expect(throws: CastError.noMediaSession) { try await media.pause() }
+        await #expect(throws: CastError.noMediaSession) { try await media.seek(to: 5) }
+        await #expect(throws: CastError.noMediaSession) { try await media.skip(by: 10) }
+        await #expect(throws: CastError.noMediaSession) { try await media.setStreamVolume(0.5) }
+        await #expect(throws: CastError.noMediaSession) { try await media.setStreamMuted(true) }
+        await #expect(throws: CastError.noMediaSession) { try await media.next() }
+        await #expect(throws: CastError.noMediaSession) { try await media.setActiveTracks([1]) }
+        await #expect(throws: CastError.noMediaSession) { try await media.stop() }
+        for type in ["PLAY", "PAUSE", "SEEK", "SET_VOLUME", "QUEUE_UPDATE", "EDIT_TRACKS_INFO"] {
+            #expect(mock.sentMessages(ofType: type).isEmpty, "\(type) was sent")
+        }
+        #expect(mock.sentMessages(ofType: "STOP").count == 1)
+
+        let status = try #require(await media.status)
+        #expect(status.playerState == .idle)
+        #expect(status.media?.duration == 596.5)
+        #expect(await media.estimatedTime() == 12)
+    }
+
+    @Test func sameSessionBroadcastAfterStopKeepsSessionEnded() async throws {
+        let (media, mock) = try await stoppedMedia()
+        broadcast(["mediaSessionId": 1, "playerState": "IDLE", "idleReason": "CANCELLED"], on: mock)
+        try await eventually { await media.status?.idleReason == .cancelled }
+        #expect(await media.hasActiveSession == false)
+        await #expect(throws: CastError.noMediaSession) { try await media.play() }
+    }
+
+    @Test func newSessionBroadcastAfterStopRevivesCommands() async throws {
+        let (media, mock) = try await stoppedMedia()
+        broadcast(["mediaSessionId": 2, "playerState": "PAUSED"], on: mock)
+        try await eventually { await media.status?.mediaSessionId == 2 }
+        #expect(await media.hasActiveSession)
+        try await media.play()
+        #expect(mock.sentMessages(ofType: "PLAY").first?.json?["mediaSessionId"]?.intValue == 2)
+    }
+
+    @Test func loadAfterStopRevivesCommands() async throws {
+        let (media, mock) = try await stoppedMedia()
+        try await media.load(MediaInformation(url: URL(string: "https://example.com/video.mp4")!, contentType: "video/mp4"))
+        #expect(await media.hasActiveSession)
+        try await media.play()
+        #expect(mock.sentMessages(ofType: "PLAY").count == 1)
+        #expect(await media.status?.playerState == .playing)
     }
 
     @Test func emptyStatusListMeansNoSession() async throws {
