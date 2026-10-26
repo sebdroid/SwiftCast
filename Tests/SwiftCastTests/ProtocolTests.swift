@@ -102,6 +102,70 @@ struct WireFuzzTests {
         }
     }
 
+    /// Arbitrary JSON payloads must never crash `InboundMessage` or the `JSONValue` accessors.
+    @Test func survivesRandomJSONPayloads() {
+        var generator = SystemRandomNumberGenerator()
+        for _ in 0..<3000 {
+            var fields: [String] = []
+            if Bool.random(using: &generator) { fields.append(#""requestId":"# + Self.randomNumber(using: &generator)) }
+            if Bool.random(using: &generator) { fields.append(#""type":"# + Self.randomValue(depth: 1, using: &generator)) }
+            for index in 0..<Int.random(in: 0..<4, using: &generator) {
+                fields.append("\"f\(index)\":" + Self.randomValue(depth: 3, using: &generator))
+            }
+            let payload = "{" + fields.shuffled(using: &generator).joined(separator: ",") + "}"
+            let message = InboundMessage(CastMessage(sourceID: "receiver-0", destinationID: "sender-0", namespace: CastNamespace.receiver.rawValue, payload: .string(payload)))
+            _ = message.type
+            if let id = message.requestID { #expect(Int32(exactly: id) != nil, "\(payload)") }
+            if let json = message.json { Self.touch(json) }
+        }
+    }
+
+    static func touch(_ value: JSONValue) {
+        _ = value.intValue
+        _ = value.doubleValue
+        _ = value.stringValue
+        _ = value.boolValue
+        value.arrayValue?.forEach(touch)
+        value.objectValue?.values.forEach(touch)
+    }
+
+    static func randomNumber(using generator: inout some RandomNumberGenerator) -> String {
+        let literals = [
+            "0", "-0", "1", "-1", "42", "2147483647", "2147483648", "-2147483648", "-2147483649",
+            "9223372036854775807", "9223372036854775808", "-9223372036854775808", "-9223372036854775809",
+            "18446744073709551616", "99999999999999999999999999999", "1e19", "-1e19", "1E308", "1e400", "-1e400",
+            "0.5", "-0.5", "42.0", "1.0e2", "4.2E-1", "1e-400", "123456789012345678901234567890.5",
+        ]
+        switch Int.random(in: 0..<4, using: &generator) {
+        case 0: return literals.randomElement(using: &generator)!
+        case 1: return String(Int64.random(in: .min ... .max, using: &generator))
+        case 2: return String(Double.random(in: -1e30...1e30, using: &generator))
+        default:
+            let mantissa = Int.random(in: -999...999, using: &generator)
+            let exponent = Int.random(in: -400...400, using: &generator)
+            return "\(mantissa)e\(exponent)"
+        }
+    }
+
+    static func randomValue(depth: Int, using generator: inout some RandomNumberGenerator) -> String {
+        let kinds = depth > 0 ? 7 : 5
+        switch Int.random(in: 0..<kinds, using: &generator) {
+        case 0: return randomNumber(using: &generator)
+        case 1: return ["null", "true", "false"].randomElement(using: &generator)!
+        case 2: return ["\"RECEIVER_STATUS\"", "\"MEDIA_STATUS\"", "\"\"", "\"\\u0000\"", "\"é\""].randomElement(using: &generator)!
+        case 3: return ["", "{", "]", "\"", "nul", "0x10", "+1", "01", "--1", "1e"].randomElement(using: &generator)!
+        case 4: return "\"" + String(Int.random(in: 0...1000, using: &generator)) + "\""
+        case 5:
+            let items = (0..<Int.random(in: 0..<4, using: &generator)).map { _ in randomValue(depth: depth - 1, using: &generator) }
+            return "[" + items.joined(separator: ",") + "]"
+        default:
+            let items = (0..<Int.random(in: 0..<4, using: &generator)).map { index in
+                "\"k\(index)\":" + randomValue(depth: depth - 1, using: &generator)
+            }
+            return "{" + items.joined(separator: ",") + "}"
+        }
+    }
+
     @Test func survivesTruncatedValidMessages() {
         let valid = ProtocolTests.ping.serialized()
         for length in 0..<valid.count {

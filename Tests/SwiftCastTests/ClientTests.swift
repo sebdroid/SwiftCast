@@ -173,6 +173,24 @@ struct ClientTests {
         #expect(await client.receiverStatus?.volume?.level == 0.25)
     }
 
+    @Test func outOfRangeRequestIDDoesNotCrashClient() async throws {
+        let mock = MockReceiver()
+        Fixtures.installDefaultReceiver(on: mock)
+        let client = makeClient(mock)
+        try await client.connect()
+        let updates = await client.receiverStatusUpdates()
+        let payload = #"{"requestId":9223372036854775808,"type":"RECEIVER_STATUS","status":{"volume":{"level":0.75,"muted":false}}}"#
+        let message = CastMessage(sourceID: CastEndpoint.platformReceiver, destinationID: "*", namespace: CastNamespace.receiver.rawValue, payload: .string(payload))
+        mock.pushRaw(try FrameCodec.frame(message))
+        for await status in updates {
+            #expect(status.volume?.level == 0.75)
+            break
+        }
+        #expect(await client.state == .connected)
+        let status = try await client.receiver.getStatus()
+        #expect(status.volume?.level == 0.5)
+    }
+
     @Test func mapsStandardErrorResponses() async throws {
         let mock = MockReceiver()
         mock.on("LAUNCH") { request, mock in
