@@ -21,7 +21,9 @@ public actor MediaController {
     /// the final `IDLE` status for display. While it is `false`, playback,
     /// volume, track and queue commands throw ``CastError/noMediaSession``
     /// without contacting the receiver. Loading media, or a status for a
-    /// different media session, makes it `true` again.
+    /// different media session, makes it `true` again. After the receiver
+    /// rejects the media session id nothing is cached, so the next status for
+    /// any session, even one reusing the same id, starts a fresh session.
     public var hasActiveSession: Bool { status != nil && !sessionEnded }
 
     private var sessionEnded = false
@@ -259,12 +261,12 @@ public actor MediaController {
         do {
             response = try await send(JSONValue.object(object), timeout: nil)
         } catch let error as CastError where error.mediaErrorInfo?.reason == .invalidMediaSessionId {
-            if status?.mediaSessionId == sessionID {
-                update(nil)
-                sessionEnded = true
-            }
+            if status?.mediaSessionId == sessionID { update(nil) }
             throw error
         }
+        // A load or broadcast may have replaced the session while this was in
+        // flight; the reply only describes the session it was sent for.
+        guard status?.mediaSessionId == sessionID else { return status }
         let committed = commit(try parseStatus(response))
         // The media messages spec invalidates the mediaSessionId on STOP, so
         // commands sent with it afterwards could only fail on the receiver.

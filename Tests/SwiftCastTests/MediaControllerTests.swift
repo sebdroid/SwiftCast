@@ -255,6 +255,22 @@ struct MediaControllerTests {
         #expect(mock.sentMessages(ofType: "PLAY").first?.json?["mediaSessionId"]?.intValue == 2)
     }
 
+    @Test func stopReplyAfterNewLoadKeepsNewSession() async throws {
+        let (media, mock) = try await loadedMedia()
+        mock.on("STOP") { _, _ in }
+        let stopping = Task { try await media.stop() }
+        try await eventually { !mock.sentMessages(ofType: "STOP").isEmpty }
+        try await media.load(MediaInformation(url: URL(string: "https://example.com/video.mp4")!, contentType: "video/mp4"))
+        let stopRequest = try #require(mock.sentMessages(ofType: "STOP").first)
+        mock.reply(to: stopRequest, Fixtures.mediaStatus(sessionID: 1, state: "IDLE", includeMedia: false))
+        let stopped = try await stopping.value
+        #expect(stopped?.mediaSessionId == 2)
+        #expect(await media.hasActiveSession)
+        #expect(await media.status?.mediaSessionId == 2)
+        try await media.play()
+        #expect(mock.sentMessages(ofType: "PLAY").first?.json?["mediaSessionId"]?.intValue == 2)
+    }
+
     @Test func commandsAfterStopFailWithoutSending() async throws {
         let (media, mock) = try await stoppedMedia()
         #expect(await media.hasActiveSession == false)
