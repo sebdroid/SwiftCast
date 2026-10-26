@@ -32,8 +32,8 @@
 - `MediaStatus` broadcasts no longer blank the queue or other fields the receiver omitted.
 - TV show metadata uses the `originalAirdate` wire key; the `originalAirDate` spelling still decodes.
 - Receiver status decoding survives unexpected `controlType` strings and bad optional fields.
-- Inbound frames are decoded without shifting the buffer per frame, messages decoded before a bad
-  frame are still delivered, and messages Chrome's `IsCastMessageValid` rejects are rejected.
+- Inbound frames are decoded without shifting the buffer per frame, and messages decoded before a
+  bad frame are still delivered.
 - `ca` capability flags parse as unsigned, so a negative value no longer sets every flag; the
   multichannel, dynamic group, volume and Cast Connect bits are modelled.
 - Device-supplied text in error descriptions and `castctl` output is stripped of control and
@@ -41,6 +41,8 @@
 
 ### Changed
 
+- A message with empty ids or a missing payload field is rejected the way Chrome's
+  `IsCastMessageValid` rejects it, and the connection is closed; before, such frames were accepted.
 - `CastDeviceBrowser` keeps a device listed for 30 seconds after it disappears from Bonjour,
   keeps a device's endpoint when another result advertises the same id, and marks the previous
   roster unseen when browsing restarts.
