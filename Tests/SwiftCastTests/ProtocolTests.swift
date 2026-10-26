@@ -13,6 +13,11 @@ struct ProtocolTests {
         payload: .string(#"{"type":"PING"}"#)
     )
 
+    @Test func frameLimitsAreTheDocumentedNumbers() {
+        #expect(FrameCodec.maximumOutboundBodyLength == 65_536)
+        #expect(FrameCodec.maximumInboundBodyLength == 131_068)
+    }
+
     @Test func serializesToReferenceProtobufBytes() {
         #expect(Self.ping.serialized().hexString == Self.pingHex)
     }
