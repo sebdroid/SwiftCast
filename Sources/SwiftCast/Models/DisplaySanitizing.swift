@@ -2,9 +2,9 @@ extension String {
     /// The string without control, line separator and paragraph separator scalars, bidirectional
     /// marks, embeddings, overrides and isolates, the word joiner and invisible operators, and the
     /// byte order mark, so text a device sends cannot smuggle terminal escapes or bidirectional
-    /// overrides into log lines. Other format scalars pass, such as U+200B, U+00AD and the tag
-    /// characters that subdivision flags are built from.
-    var displaySanitized: String {
+    /// overrides into log lines or terminal output. Other format scalars pass, such as U+200B,
+    /// U+00AD and the tag characters that subdivision flags are built from.
+    package var displaySanitized: String {
         var scalars = String.UnicodeScalarView()
         scalars.append(contentsOf: unicodeScalars.filter { scalar in
             switch scalar.properties.generalCategory {

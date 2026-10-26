@@ -22,8 +22,8 @@ func describe(_ status: ReceiverStatus) {
     }
     if status.isStandBy == true { print("standby: true") }
     for app in status.applications ?? [] {
-        print("app: \((app.displayName ?? app.appId.rawValue).sanitized()) [\(app.appId.rawValue.sanitized())] session=\(app.sessionId.sanitized())\(app.isIdleScreen == true ? " (idle screen)" : "")")
-        if let text = app.statusText, !text.isEmpty { print("  status: \(text.sanitized())") }
+        print("app: \((app.displayName ?? app.appId.rawValue).displaySanitized) [\(app.appId.rawValue.displaySanitized)] session=\(app.sessionId.displaySanitized)\(app.isIdleScreen == true ? " (idle screen)" : "")")
+        if let text = app.statusText, !text.isEmpty { print("  status: \(text.displaySanitized)") }
     }
 }
 
@@ -31,8 +31,8 @@ func describe(_ status: MediaStatus?) {
     guard let status else { print("media: none"); return }
     let time = status.currentTime.map { String(format: "%.1fs", $0) } ?? "?"
     let duration = status.media?.duration.map { String(format: "%.1fs", $0) } ?? "?"
-    let reason = status.idleReason.map { " (\($0.rawValue.sanitized()))" } ?? ""
-    print("media: \((status.media?.metadata?.title ?? status.media?.contentId ?? "unknown").sanitized()) \(status.playerState.rawValue.sanitized())\(reason) \(time)/\(duration)")
+    let reason = status.idleReason.map { " (\($0.rawValue.displaySanitized))" } ?? ""
+    print("media: \((status.media?.metadata?.title ?? status.media?.contentId ?? "unknown").displaySanitized) \(status.playerState.rawValue.displaySanitized)\(reason) \(time)/\(duration)")
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
@@ -42,7 +42,7 @@ if command == "scan" {
     let devices = await CastDiscovery.scan(for: .seconds(3))
     if devices.isEmpty { print("No Cast devices found.") }
     for device in devices {
-        print("\(device.name.sanitized())\t\((device.modelName ?? "-").sanitized())\tid=\(device.id.sanitized())\tcaps=\(device.capabilities.rawValue)")
+        print("\(device.name.displaySanitized)\t\((device.modelName ?? "-").displaySanitized)\tid=\(device.id.displaySanitized)\tcaps=\(device.capabilities.rawValue)")
     }
     exit(0)
 }
@@ -91,18 +91,18 @@ do {
         let seconds = arguments.count >= 3 ? Double(arguments[2]) ?? 30 : 30
         describe(try await client.receiver.getStatus())
         let availability = try await client.receiver.availability(of: [.defaultMediaReceiver, .youTube, .jellyfin])
-        for (app, state) in availability.sorted(by: { $0.key.rawValue < $1.key.rawValue }) { print("availability \(app.rawValue.sanitized()): \(state.rawValue)") }
+        for (app, state) in availability.sorted(by: { $0.key.rawValue < $1.key.rawValue }) { print("availability \(app.rawValue.displaySanitized): \(state.rawValue)") }
         let states = await client.stateUpdates()
         let watcher = Task {
             for await status in await client.receiverStatusUpdates() { describe(status) }
         }
         let stateWatcher = Task {
-            for await state in states { print("state: \("\(state)".sanitized())") }
+            for await state in states { print("state: \("\(state)".displaySanitized)") }
         }
         try await Task.sleep(for: .seconds(seconds))
         watcher.cancel()
         stateWatcher.cancel()
-        print("final state: \("\(await client.state)".sanitized())")
+        print("final state: \("\(await client.state)".displaySanitized)")
     case "volume":
         guard arguments.count >= 3, let level = Double(arguments[2]) else { usage() }
         describe(try await client.receiver.setVolume(level))
@@ -110,13 +110,13 @@ do {
         let status = try await client.receiver.getStatus()
         if let app = status.foregroundApplication {
             try await client.receiver.stop(app)
-            print("Stopped \((app.displayName ?? app.appId.rawValue).sanitized()).")
+            print("Stopped \((app.displayName ?? app.appId.rawValue).displaySanitized).")
         }
     default:
         usage()
     }
     await client.disconnect()
 } catch {
-    print("error: \(error.localizedDescription.sanitized())")
+    print("error: \(error.localizedDescription.displaySanitized)")
     exit(1)
 }
