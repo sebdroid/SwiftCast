@@ -122,6 +122,20 @@ struct MediaControllerTests {
         await #expect(throws: CastError.self) { try await media.pause() }
     }
 
+    @Test func receiverStatusFromTheAppDoesNotCloseSession() async throws {
+        let (client, mock) = try await connectedClient()
+        let media = try await client.launchMediaReceiver()
+        try await media.load(MediaInformation(url: URL(string: "https://example.com/video.mp4")!, contentType: "video/mp4"))
+        var updates = await media.statusUpdates().makeAsyncIterator()
+        _ = await updates.next()
+
+        mock.push(Fixtures.receiverStatus(apps: []), namespace: .receiver, from: Fixtures.transportID, to: "*")
+        mock.push(Fixtures.mediaStatus(sessionID: 1, state: "PAUSED", includeMedia: false), namespace: .media, from: Fixtures.transportID, to: "*")
+        let next = await updates.next()
+        #expect(next??.playerState == .paused)
+        #expect(await media.isClosed == false)
+    }
+
     @Test func sessionClosesOnVirtualConnectionClose() async throws {
         let (client, mock) = try await connectedClient()
         let media = try await client.launchMediaReceiver()

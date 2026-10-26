@@ -493,6 +493,7 @@ struct ClientTests {
         mock.on("hello") { request, mock in mock.reply(to: request, ["type": "world"]) }
         let client = makeClient(mock)
         try await client.connect()
+        try await client.openVirtualConnection(to: "web-1")
         let messages = client.messages(in: custom)
         let reply = try await client.request(["type": "hello"] as JSONValue, namespace: custom, to: "web-1")
         #expect(reply.type == "world")
@@ -500,6 +501,146 @@ struct ClientTests {
             #expect(message.type == "world")
             break
         }
+    }
+
+    // MARK: - Inbound routing
+
+    @Test func replyOnAnotherNamespaceDoesNotResolveRequest() async throws {
+        let mock = MockReceiver()
+        mock.on("GET_STATUS") { request, mock in
+            var stray = Fixtures.receiverStatus(level: 0.9).objectValue ?? [:]
+            stray["requestId"] = request.json?["requestId"]
+            mock.push(.object(stray), namespace: .media, from: request.destinationID)
+            mock.reply(to: request, Fixtures.receiverStatus(level: 0.5))
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        let status = try await client.receiver.getStatus()
+        #expect(status.volume?.level == 0.5)
+    }
+
+    @Test func replyOnAnotherNamespaceAloneTimesOut() async throws {
+        let mock = MockReceiver()
+        mock.on("GET_STATUS") { request, mock in
+            var stray: [String: JSONValue] = ["type": "MEDIA_STATUS", "status": []]
+            stray["requestId"] = request.json?["requestId"]
+            mock.push(.object(stray), namespace: .media, from: request.destinationID)
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        await #expect(throws: CastError.timeout) {
+            _ = try await client.request(["type": "GET_STATUS"] as JSONValue, namespace: .receiver, to: "receiver-0", timeout: .milliseconds(200))
+        }
+    }
+
+    @Test func replyFromAnotherSourceDoesNotResolveRequest() async throws {
+        let mock = MockReceiver()
+        mock.on("GET_STATUS") { request, mock in
+            var stray = Fixtures.receiverStatus(level: 0.9).objectValue ?? [:]
+            stray["requestId"] = request.json?["requestId"]
+            mock.push(.object(stray), namespace: .receiver, from: Fixtures.transportID)
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        await #expect(throws: CastError.timeout) {
+            _ = try await client.request(["type": "GET_STATUS"] as JSONValue, namespace: .receiver, to: "receiver-0", timeout: .milliseconds(200))
+        }
+        #expect(await client.receiverStatus == nil)
+    }
+
+    @Test func messageForAnotherSenderIsNotDelivered() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        var messages = client.messages(in: .receiver).makeAsyncIterator()
+        mock.push(Fixtures.receiverStatus(level: 0.9), namespace: .receiver, to: "sender-someone-else")
+        mock.push(Fixtures.receiverStatus(level: 0.4), namespace: .receiver)
+        let delivered = try #require(await messages.next())
+        #expect(delivered.destinationID == client.senderID)
+        #expect(await client.receiverStatus?.volume?.level == 0.4)
+    }
+
+    @Test func mediaFromUnopenedTransportIsNotDelivered() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        var messages = client.messages(in: .media).makeAsyncIterator()
+        mock.push(Fixtures.mediaStatus(sessionID: 9), namespace: .media, from: "web-9", to: "*")
+        mock.push(Fixtures.mediaStatus(sessionID: 1), namespace: .media, from: Fixtures.transportID, to: "*")
+        let delivered = try #require(await messages.next())
+        #expect(delivered.sourceID == Fixtures.transportID)
+    }
+
+    @Test func receiverStatusFromAnotherSourceIsIgnored() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        var updates = await client.receiverStatusUpdates().makeAsyncIterator()
+        mock.push(Fixtures.receiverStatus(level: 0.9), namespace: .receiver, from: Fixtures.transportID, to: "*")
+        mock.push(Fixtures.receiverStatus(level: 0.4), namespace: .receiver, to: "*")
+        let first = try #require(await updates.next())
+        #expect(first.volume?.level == 0.4)
+    }
+
+    @Test func nonObjectPayloadsOnGoogleNamespacesAreDropped() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        var messages = client.messages(in: .receiver).makeAsyncIterator()
+        mock.push(payload: .string("not json"), namespace: .receiver)
+        mock.push(payload: .string("[1, 2]"), namespace: .receiver)
+        mock.push(payload: .string(#""RECEIVER_STATUS""#), namespace: .receiver)
+        mock.push(payload: .binary(Data([1, 2, 3])), namespace: .receiver)
+        mock.push(Fixtures.receiverStatus(level: 0.4), namespace: .receiver)
+        let delivered = try #require(await messages.next())
+        #expect(delivered.type == "RECEIVER_STATUS")
+        #expect(await client.state == .connected)
+    }
+
+    @Test func customNamespacesReceiveRawPayloads() async throws {
+        let mock = MockReceiver()
+        let custom = CastNamespace("urn:x-cast:com.example.custom")
+        let client = makeClient(mock)
+        try await client.connect()
+        try await client.openVirtualConnection(to: "web-1")
+        var messages = client.messages(in: custom).makeAsyncIterator()
+        mock.push(payload: .string("not json"), namespace: custom, from: "web-1")
+        mock.push(payload: .binary(Data([1, 2, 3])), namespace: custom, from: "web-1")
+        let text = try #require(await messages.next())
+        let binary = try #require(await messages.next())
+        #expect(text.json == nil)
+        #expect(text.raw.stringPayload == "not json")
+        #expect(binary.raw.payload == .binary(Data([1, 2, 3])))
+    }
+
+    @Test func failedConnectLeavesNoVirtualConnection() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.failSends(ofType: "CONNECT", with: .connectionFailed("broken pipe"))
+        await #expect(throws: CastError.connectionFailed("broken pipe")) {
+            try await client.openVirtualConnection(to: Fixtures.transportID)
+        }
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func requestIDsAreSequentialPerClient() async throws {
+        let mock = MockReceiver()
+        Fixtures.installDefaultReceiver(on: mock)
+        let client = makeClient(mock)
+        try await client.connect()
+        _ = try await client.receiver.getStatus()
+        _ = try await client.receiver.getStatus()
+        let otherMock = MockReceiver()
+        Fixtures.installDefaultReceiver(on: otherMock)
+        let second = makeClient(otherMock)
+        try await second.connect()
+        _ = try await second.receiver.getStatus()
+        #expect(mock.sentMessages(ofType: "GET_STATUS").compactMap(\.requestID) == [1, 2])
+        #expect(otherMock.sentMessages(ofType: "GET_STATUS").compactMap(\.requestID) == [1])
     }
 
     @Test func availability() async throws {

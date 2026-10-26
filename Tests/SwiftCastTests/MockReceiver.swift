@@ -13,6 +13,7 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         var openError: CastError?
         var sendFailures: [String: CastError] = [:]
         var isOpen = false
+        var clientID: String?
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
@@ -60,6 +61,7 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
             let inbound = InboundMessage(message)
             let (handler, failure) = state.withLock { state -> (Handler?, CastError?) in
                 state.sent.append(inbound)
+                if state.clientID == nil { state.clientID = inbound.sourceID }
                 return (inbound.type.flatMap { state.handlers[$0] }, inbound.type.flatMap { state.sendFailures[$0] })
             }
             if let failure { throw failure }
@@ -78,10 +80,20 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
 
     // MARK: Device → client
 
-    /// Sends a JSON message from `source` to the client.
-    func push(_ json: JSONValue, namespace: CastNamespace, from source: String = CastEndpoint.platformReceiver, to destination: String = "sender-0") {
+    /// The sender id the client uses, learned from the first message it sent.
+    var clientID: String? { state.withLock { $0.clientID } }
+
+    /// Sends a JSON message from `source` to the client. `destination`
+    /// defaults to the client's own sender id, or `*` before it is known.
+    func push(_ json: JSONValue, namespace: CastNamespace, from source: String = CastEndpoint.platformReceiver, to destination: String? = nil) {
         let data = try! JSONEncoder().encode(json)
-        let message = CastMessage(sourceID: source, destinationID: destination, namespace: namespace.rawValue, payload: .string(String(decoding: data, as: UTF8.self)))
+        push(payload: .string(String(decoding: data, as: UTF8.self)), namespace: namespace, from: source, to: destination)
+    }
+
+    /// Sends a message with an arbitrary payload, such as malformed JSON or binary data.
+    func push(payload: CastMessage.Payload, namespace: CastNamespace, from source: String = CastEndpoint.platformReceiver, to destination: String? = nil) {
+        let destination = destination ?? clientID ?? CastEndpoint.broadcast
+        let message = CastMessage(sourceID: source, destinationID: destination, namespace: namespace.rawValue, payload: payload)
         continuation.yield(try! FrameCodec.frame(message))
     }
 

@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os
 
 /// A connection to a single Cast device.
 ///
@@ -76,6 +77,14 @@ public actor CastClient {
     /// The most recent receiver status (from a request or broadcast).
     public private(set) var receiverStatus: ReceiverStatus?
 
+    /// Replies are matched on the namespace and peer a request went to as
+    /// well as its id, so a stray message reusing the id cannot answer it.
+    private struct PendingKey: Hashable {
+        let namespace: CastNamespace
+        let destination: String
+        let requestID: Int
+    }
+
     private struct PendingRequest {
         let continuation: CheckedContinuation<InboundMessage, any Error>
         let timeoutTask: Task<Void, Never>
@@ -85,7 +94,7 @@ public actor CastClient {
     private var transport: (any CastTransport)?
     private var generation = 0
     private var decoder = FrameDecoder()
-    private var pending: [Int: PendingRequest] = [:]
+    private var pending: [PendingKey: PendingRequest] = [:]
     private var nextRequestID = 1
     private var connectedDestinations: Set<String> = []
     private var protocolVersions: [String: Int] = [:]
@@ -221,7 +230,16 @@ public actor CastClient {
         receiverStatusBroadcaster.subscribe(initial: receiverStatus)
     }
 
-    /// Streams every inbound message, optionally filtered to one namespace.
+    /// Streams inbound messages, optionally filtered to one namespace.
+    ///
+    /// Only messages addressed to this client's ``senderID`` or to the
+    /// broadcast id `*` are delivered. Apart from the transport namespaces
+    /// (`tp.connection`, `tp.heartbeat` and `tp.deviceauth`), a message is only
+    /// delivered when it comes from a peer with an open virtual connection,
+    /// so open one with ``openVirtualConnection(to:)`` before listening to an
+    /// application. On `urn:x-cast:com.google.cast.*` namespaces, payloads that
+    /// are not a JSON object are dropped; custom namespaces receive every
+    /// payload as is, with ``InboundMessage/json`` `nil` when it is not JSON.
     ///
     /// Streams end when the connection closes.
     public nonisolated func messages(in namespace: CastNamespace? = nil) -> AsyncStream<InboundMessage> {
@@ -267,6 +285,7 @@ public actor CastClient {
         }
         let requestID = nextRequestID
         nextRequestID = nextRequestID == Int32.max ? 1 : nextRequestID + 1
+        let key = PendingKey(namespace: namespace, destination: destination, requestID: requestID)
         object["requestId"] = .number(Double(requestID))
         let message = try Self.makeMessage(JSONValue.object(object), source: senderID, namespace: namespace, destination: destination)
         let timeout = timeout ?? configuration.requestTimeout
@@ -276,24 +295,24 @@ public actor CastClient {
                 let timeoutTask = Task { [weak self] in
                     try? await Task.sleep(for: timeout)
                     guard !Task.isCancelled else { return }
-                    await self?.resolve(requestID, with: .failure(CastError.timeout))
+                    await self?.resolve(key, with: .failure(CastError.timeout))
                 }
-                pending[requestID] = PendingRequest(continuation: continuation, timeoutTask: timeoutTask)
+                pending[key] = PendingRequest(continuation: continuation, timeoutTask: timeoutTask)
                 if Task.isCancelled {
                     // The cancellation handler may have run before registration.
-                    resolve(requestID, with: .failure(CancellationError()))
+                    resolve(key, with: .failure(CancellationError()))
                     return
                 }
                 Task {
                     do {
                         try await self.sendRaw(message)
                     } catch {
-                        self.resolve(requestID, with: .failure(error))
+                        self.resolve(key, with: .failure(error))
                     }
                 }
             }
         } onCancel: {
-            Task { await self.resolve(requestID, with: .failure(CancellationError())) }
+            Task { await self.resolve(key, with: .failure(CancellationError())) }
         }
 
         if let error = Self.standardError(in: response) { throw error }
@@ -306,8 +325,15 @@ public actor CastClient {
     /// Does nothing if one is already open.
     public func openVirtualConnection(to destination: String) async throws {
         guard !connectedDestinations.contains(destination) else { return }
-        try await sendJSON(connectPayload(to: destination), namespace: .connection, to: destination)
+        // Registered before the write so a message the peer sends as soon as
+        // it sees CONNECT is not dropped as coming from an unknown peer.
         connectedDestinations.insert(destination)
+        do {
+            try await sendJSON(connectPayload(to: destination), namespace: .connection, to: destination)
+        } catch {
+            connectedDestinations.remove(destination)
+            throw error
+        }
     }
 
     /// Closes the virtual connection to `destination`.
@@ -359,6 +385,11 @@ public actor CastClient {
 
     /// `reasonCode` 5 tells the receiver the sender closed the connection on purpose.
     static let closePayload: JSONValue = ["type": "CLOSE", "reasonCode": 5]
+
+    /// Namespaces that work below virtual connections, so they are accepted from any peer.
+    static let transportNamespaces: Set<CastNamespace> = [.connection, .heartbeat, .deviceAuth]
+
+    private static let logger = Logger(subsystem: "SwiftCast", category: "CastClient")
 
     /// The protocol version the receiver reported in `CONNECTED` for `destination`.
     func negotiatedProtocolVersion(for destination: String) -> Int? {
@@ -457,8 +488,8 @@ public actor CastClient {
         stateBroadcaster.yield(newState)
     }
 
-    private func resolve(_ requestID: Int, with result: Result<InboundMessage, any Error>) {
-        guard let request = pending.removeValue(forKey: requestID) else { return }
+    private func resolve(_ key: PendingKey, with result: Result<InboundMessage, any Error>) {
+        guard let request = pending.removeValue(forKey: key) else { return }
         request.timeoutTask.cancel()
         request.continuation.resume(with: result)
     }
@@ -477,6 +508,7 @@ public actor CastClient {
     }
 
     private func handle(_ message: InboundMessage) {
+        guard accepts(message) else { return }
         switch message.namespace {
         case .heartbeat:
             if message.type == "PING" {
@@ -501,7 +533,7 @@ public actor CastClient {
             default:
                 break
             }
-        case .receiver:
+        case .receiver where message.sourceID == CastEndpoint.platformReceiver:
             if message.type == "RECEIVER_STATUS", let status = try? message.json?["status"]?.decode(ReceiverStatus.self) {
                 updateReceiverStatus(status)
             }
@@ -509,10 +541,32 @@ public actor CastClient {
             break
         }
 
-        if let requestID = message.requestID, requestID != 0, pending[requestID] != nil {
-            resolve(requestID, with: .success(message))
+        if let requestID = message.requestID, requestID != 0 {
+            resolve(PendingKey(namespace: message.namespace, destination: message.sourceID, requestID: requestID), with: .success(message))
         }
         messageBroadcaster.yield(message)
+    }
+
+    /// Whether an inbound message may be routed at all. Messages for other
+    /// senders, from peers without a virtual connection, or with a payload a
+    /// Google namespace cannot carry are dropped, as chromium's and open
+    /// screen's cast channel code do.
+    private func accepts(_ message: InboundMessage) -> Bool {
+        let namespace = message.namespace
+        guard message.destinationID == senderID || message.destinationID == CastEndpoint.broadcast else {
+            Self.logger.debug("Dropping \(namespace.rawValue, privacy: .public) message addressed to \(message.destinationID, privacy: .public)")
+            return false
+        }
+        guard Self.transportNamespaces.contains(namespace) || connectedDestinations.contains(message.sourceID) else {
+            Self.logger.debug("Dropping \(namespace.rawValue, privacy: .public) message from \(message.sourceID, privacy: .public), which has no virtual connection")
+            return false
+        }
+        // Device auth is binary by design; every other Google namespace speaks JSON objects.
+        if namespace.rawValue.hasPrefix("urn:x-cast:com.google.cast."), namespace != .deviceAuth, message.json?.objectValue == nil {
+            Self.logger.debug("Dropping \(namespace.rawValue, privacy: .public) message from \(message.sourceID, privacy: .public) whose payload is not a JSON object")
+            return false
+        }
+        return true
     }
 
     private func startHeartbeat(generation: Int) {
