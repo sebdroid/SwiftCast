@@ -15,6 +15,18 @@ public actor MediaController {
     public private(set) var statusDate: Date?
     /// `true` once the application session has ended or the connection was lost.
     public private(set) var isClosed = false
+    /// `true` while ``status`` describes a media session that accepts
+    /// commands. It turns `false` once a ``stop()`` reply arrives or the
+    /// receiver rejects the session id, even though ``status`` may still hold
+    /// the final `IDLE` status for display. While it is `false`, playback,
+    /// volume, track and queue commands throw ``CastError/noMediaSession``
+    /// without contacting the receiver. Loading media, or a status for a
+    /// different media session, makes it `true` again. After the receiver
+    /// rejects the media session id nothing is cached, so the next status for
+    /// any session, even one reusing the same id, starts a fresh session.
+    public var hasActiveSession: Bool { status != nil && !sessionEnded }
+
+    private var sessionEnded = false
 
     private let statusBroadcaster = Broadcaster<MediaStatus?>()
     private var listenTask: Task<Void, Never>?
@@ -131,10 +143,15 @@ public actor MediaController {
         try await sessionCommand("PAUSE")
     }
 
-    /// Stops playback and unloads the media.
+    /// Stops playback and unloads the media. The receiver normally answers
+    /// with an `IDLE` status for the stopped session, which is kept so a UI
+    /// can go on showing what was playing. The stopped session no longer
+    /// takes commands, so later session commands throw
+    /// ``CastError/noMediaSession`` until new media is loaded; see
+    /// ``hasActiveSession``.
     @discardableResult
     public func stop() async throws -> MediaStatus? {
-        try await sessionCommand("STOP")
+        try await sessionCommand("STOP", endsSession: true)
     }
 
     /// Seeks to an absolute position in seconds.
@@ -219,7 +236,7 @@ public actor MediaController {
     @discardableResult
     public func refreshStatus() async throws -> MediaStatus? {
         let response = try await send(["type": "GET_STATUS"] as JSONValue, timeout: nil)
-        return apply(response)
+        return commit(try parseStatus(response))
     }
 
     /// Stops listening and closes the virtual connection to the application.
@@ -234,14 +251,28 @@ public actor MediaController {
 
     // MARK: - Private
 
-    private func sessionCommand(_ type: String, _ fields: [String: JSONValue?] = [:]) async throws -> MediaStatus? {
-        guard let sessionID = status?.mediaSessionId else { throw CastError.noMediaSession }
+    private func sessionCommand(_ type: String, _ fields: [String: JSONValue?] = [:], endsSession: Bool = false) async throws -> MediaStatus? {
+        guard !sessionEnded, let sessionID = status?.mediaSessionId else { throw CastError.noMediaSession }
         var object: [String: JSONValue] = ["type": .string(type), "mediaSessionId": .number(Double(sessionID))]
         for (key, value) in fields {
             if let value { object[key] = value }
         }
-        let response = try await send(JSONValue.object(object), timeout: nil)
-        return apply(response)
+        let response: InboundMessage
+        do {
+            response = try await send(JSONValue.object(object), timeout: nil)
+        } catch let error as CastError where error.mediaErrorInfo?.reason == .invalidMediaSessionId {
+            if status?.mediaSessionId == sessionID { update(nil) }
+            throw error
+        }
+        // A load or broadcast may have replaced the session while this was in
+        // flight; the reply only describes the session it was sent for.
+        guard status?.mediaSessionId == sessionID else { return status }
+        let committed = commit(try parseStatus(response))
+        // The media messages spec invalidates the mediaSessionId on STOP, so
+        // commands sent with it afterwards could only fail on the receiver.
+        // A reply for another session describes one that is still live.
+        if endsSession, committed?.mediaSessionId == sessionID { sessionEnded = true }
+        return committed
     }
 
     private func send(_ payload: some Encodable & Sendable, timeout: Duration?) async throws -> InboundMessage {
@@ -249,8 +280,10 @@ public actor MediaController {
         return try await client.request(payload, namespace: .media, to: application.transportId, timeout: timeout)
     }
 
+    /// Loads start a new media session, so their status replaces the cache
+    /// even when the receiver reuses the session id.
     private func requireStatus(_ response: InboundMessage) throws -> MediaStatus {
-        guard let status = apply(response) else {
+        guard let status = commit(try parseStatus(response), replacing: true) else {
             throw CastError.unexpectedResponse("Media status missing from response")
         }
         return status
@@ -262,20 +295,49 @@ public actor MediaController {
         // late-delivered reply (such as the empty GET_STATUS sent on attach)
         // could overwrite the newer status from a LOAD.
         guard message.type == "MEDIA_STATUS", (message.requestID ?? 0) == 0 else { return }
-        apply(message)
+        // As in Chrome, a broadcast that cannot be parsed leaves the current
+        // state alone. An empty status list does clear it: that is how a
+        // receiver reports that no media session is left.
+        let parsed: MediaStatusEntry?
+        do { parsed = try parseStatus(message) } catch { return }
+        commit(parsed)
     }
 
-    @discardableResult
-    private func apply(_ message: InboundMessage) -> MediaStatus? {
-        guard message.type == "MEDIA_STATUS", let entries = message.json?["status"]?.arrayValue else {
-            return status
+    /// `nil` means the receiver has no media session. Throws, without
+    /// touching state, when the message is not a usable `MEDIA_STATUS`.
+    /// Only the first entry is read: a status message carries just the
+    /// sessions that changed or were asked about.
+    private func parseStatus(_ message: InboundMessage) throws -> MediaStatusEntry? {
+        guard message.type == "MEDIA_STATUS" else {
+            throw CastError.unexpectedResponse("Expected MEDIA_STATUS, got \(message.type ?? "untyped message")")
         }
-        guard let first = entries.first, var newStatus = try? first.decode(MediaStatus.self) else {
+        guard let entries = message.json?["status"]?.arrayValue else {
+            throw CastError.malformedMessage("MEDIA_STATUS has no status list")
+        }
+        guard let first = entries.first else { return nil }
+        guard let decoded = try? first.decode(MediaStatusEntry.self) else {
+            throw CastError.malformedMessage("Media status entry could not be decoded")
+        }
+        return decoded
+    }
+
+    /// Applies an entry onto the cached status of the same media session.
+    /// A different session, or `replacing`, starts from the entry alone so
+    /// nothing of the previous session's media or queue survives, and is
+    /// treated as a live session again.
+    @discardableResult
+    private func commit(_ entry: MediaStatusEntry?, replacing: Bool = false) -> MediaStatus? {
+        guard let entry else {
             update(nil)
             return nil
         }
-        if newStatus.media == nil, let previous = status, previous.mediaSessionId == newStatus.mediaSessionId {
-            newStatus.media = previous.media
+        let newStatus: MediaStatus
+        if !replacing, let cached = status, cached.mediaSessionId == entry.status.mediaSessionId {
+            let elapsed = statusDate.map { max(0, Date().timeIntervalSince($0)) } ?? 0
+            newStatus = entry.applied(to: cached, elapsed: elapsed)
+        } else {
+            newStatus = entry.status
+            sessionEnded = false
         }
         update(newStatus)
         return newStatus

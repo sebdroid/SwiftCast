@@ -24,7 +24,11 @@ public struct InboundMessage: Sendable, Hashable {
     public var type: String? { json?["type"]?.stringValue }
 
     /// The `requestId` the message responds to; `0` or `nil` for unsolicited messages.
-    public var requestID: Int? { json?["requestId"]?.intValue }
+    /// Only 32-bit integers are accepted.
+    public var requestID: Int? {
+        guard let number = json?["requestId"]?.doubleValue, let id = Int32(exactly: number) else { return nil }
+        return Int(id)
+    }
 
     /// Decodes the payload as `T`.
     public func decode<T: Decodable>(_ type: T.Type = T.self) throws -> T {
