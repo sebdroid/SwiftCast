@@ -243,6 +243,18 @@ struct MediaControllerTests {
         return (media, mock)
     }
 
+    @Test func stopReplyForAnotherSessionKeepsCommandsLive() async throws {
+        let (media, mock) = try await loadedMedia()
+        mock.on("STOP") { request, mock in
+            mock.reply(to: request, Fixtures.mediaStatus(sessionID: 2, state: "PAUSED"))
+        }
+        try await media.stop()
+        #expect(await media.status?.mediaSessionId == 2)
+        #expect(await media.hasActiveSession)
+        try await media.play()
+        #expect(mock.sentMessages(ofType: "PLAY").first?.json?["mediaSessionId"]?.intValue == 2)
+    }
+
     @Test func commandsAfterStopFailWithoutSending() async throws {
         let (media, mock) = try await stoppedMedia()
         #expect(await media.hasActiveSession == false)

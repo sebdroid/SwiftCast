@@ -268,7 +268,8 @@ public actor MediaController {
         let committed = commit(try parseStatus(response))
         // The media messages spec invalidates the mediaSessionId on STOP, so
         // commands sent with it afterwards could only fail on the receiver.
-        if endsSession { sessionEnded = true }
+        // A reply for another session describes one that is still live.
+        if endsSession, committed?.mediaSessionId == sessionID { sessionEnded = true }
         return committed
     }
 
