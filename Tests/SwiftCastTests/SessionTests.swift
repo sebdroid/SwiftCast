@@ -125,6 +125,78 @@ struct SessionTests {
         #expect(attempts.count == starts.count + 1)
     }
 
+    @Test func windowEqualToIntervalMakesExactlyOneAttempt() async throws {
+        let first = MockReceiver()
+        Fixtures.installDefaultReceiver(on: first)
+        let attempts = AttemptLog()
+        let session = CastSession { _ in
+            if attempts.record() == 1 { return CastClient { first } }
+            let failing = MockReceiver()
+            failing.failOpen(with: .connectionFailed("unreachable"))
+            return CastClient { failing }
+        }
+        let interval = Duration.milliseconds(100)
+        session.reconnectPolicy = CastSession.ReconnectPolicy(attemptInterval: interval, window: interval)
+        try await session.connect(to: device)
+        first.drop(with: CastError.connectionFailed("gone"))
+        try await eventually { await MainActor.run { session.connectionState == .reconnecting(device, attempt: 1) } }
+        try await eventually {
+            await MainActor.run { if case .failed = session.connectionState { true } else { false } }
+        }
+        #expect(session.connectionState == .failed(device, .connectionFailed("gone")))
+        try await Task.sleep(for: interval * 2)
+        #expect(attempts.count == 2)
+    }
+
+    @Test func deviceThatDropsAfterConnectingGetsAFreshWindowPerLoss() async throws {
+        let healthy = (0..<5).map { _ in MockReceiver() }
+        healthy.forEach { Fixtures.installDefaultReceiver(on: $0) }
+        let attempts = AttemptLog()
+        let session = CastSession { _ in
+            let index = attempts.record()
+            if index <= healthy.count { return CastClient { healthy[index - 1] } }
+            let silent = MockReceiver()
+            silent.failOpen(with: .connectionFailed("unreachable"))
+            return CastClient { silent }
+        }
+        let interval = Duration.milliseconds(100)
+        let window = Duration.milliseconds(250)
+        session.reconnectPolicy = CastSession.ReconnectPolicy(attemptInterval: interval, window: window)
+        try await session.connect(to: device)
+
+        var losses: [ContinuousClock.Instant] = []
+        for (index, mock) in healthy.dropLast().enumerated() {
+            losses.append(.now)
+            mock.drop(with: CastError.connectionFailed("reset"))
+            try await eventually { attempts.count >= index + 2 }
+            try await eventually { await MainActor.run { session.isConnected } }
+        }
+        let starts = attempts.instants
+        #expect(starts.count == healthy.count)
+        for (loss, start) in zip(losses, starts.dropFirst()) {
+            #expect(start - loss >= interval)
+        }
+        // Each loss opens its own window, so reconnecting continues past the first one.
+        #expect(starts[healthy.count - 1] - losses[0] > window)
+        #expect(healthy.dropFirst().allSatisfy { !$0.sentMessages(ofType: "GET_STATUS").isEmpty })
+
+        let finalLoss = ContinuousClock.now
+        healthy[healthy.count - 1].drop(with: CastError.connectionFailed("reset"))
+        try await eventually {
+            await MainActor.run { if case .failed = session.connectionState { true } else { false } }
+        }
+        let failedAt = ContinuousClock.now
+        #expect(session.connectionState == .failed(device, .connectionFailed("reset")))
+        #expect(failedAt - finalLoss <= window + interval)
+
+        let retries = attempts.instants.dropFirst(healthy.count)
+        #expect((1...3).contains(retries.count))
+        if let firstRetry = retries.first { #expect(firstRetry - finalLoss >= interval) }
+        for (previous, next) in zip(retries, retries.dropFirst()) {
+            #expect(next - previous >= interval)
+        }
+    }
+
     @Test func rejoinsAppThatAppearsAfterReconnect() async throws {
         let first = MockReceiver()
         Fixtures.installDefaultReceiver(on: first, appRunning: true)

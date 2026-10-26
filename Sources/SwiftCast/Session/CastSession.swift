@@ -49,7 +49,10 @@ public final class CastSession {
         var rejoinInterval: Duration = .seconds(1)
         var rejoinWindow: Duration = .seconds(15)
 
+        /// - Precondition: `window` is at least `attemptInterval`, so every
+        ///   loss gets at least one attempt before the session fails.
         public init(attemptInterval: Duration = .seconds(3), window: Duration = .seconds(40)) {
+            precondition(window >= attemptInterval, "reconnect window must allow at least one attempt")
             self.attemptInterval = attemptInterval
             self.window = window
         }
@@ -328,10 +331,11 @@ public final class CastSession {
         }
         let policy = reconnectPolicy
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: policy.window)
-        var nextAttempt = clock.now.advanced(by: policy.attemptInterval)
+        let lost = clock.now
+        let deadline = lost.advanced(by: policy.window)
+        var nextAttempt = lost.advanced(by: policy.attemptInterval)
         var attempt = 0
-        while nextAttempt <= deadline {
+        repeat {
             attempt += 1
             connectionState = .reconnecting(device, attempt: attempt)
             try? await clock.sleep(until: nextAttempt)
@@ -343,7 +347,7 @@ public final class CastSession {
                 guard lostEpoch == epoch else { return }
             }
             nextAttempt = clock.now.advanced(by: policy.attemptInterval)
-        }
+        } while nextAttempt <= deadline
         connectionState = .failed(device, error)
     }
 
