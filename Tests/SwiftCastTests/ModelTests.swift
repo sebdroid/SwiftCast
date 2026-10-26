@@ -270,6 +270,15 @@ struct ModelTests {
         #expect(launch.errorDescription == "Failed to launch app: DenTV")
     }
 
+    @Test func displaySanitizedDropsNewlinesTabsAndCarriageReturns() {
+        #expect("a\nb\tc\r".displaySanitized == "abc")
+    }
+
+    @Test func displaySanitizedKeepsPlainTextWithSpaces() {
+        let text = "Living Room TV  (onn. 4K) é 日本"
+        #expect(text.displaySanitized == text)
+    }
+
     @Test func displaySanitizedKeepsZeroWidthJoinerSequences() {
         let text = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"
         #expect(Array(text.displaySanitized.unicodeScalars) == Array(text.unicodeScalars))
