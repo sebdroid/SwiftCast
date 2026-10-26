@@ -622,7 +622,38 @@ struct ClientTests {
         #expect(app.transportId == "web-2")
     }
 
-    @Test func concurrentLaunchThrowsRequestInFlight() async throws {
+    @Test func concurrentLaunchOfTheSameAppSharesOneLaunch() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let firstStatuses = OSAllocatedUnfairLock<[String]>(initialState: [])
+        let secondStatuses = OSAllocatedUnfairLock<[String]>(initialState: [])
+        let first = Task {
+            try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) { status in
+                firstStatuses.withLock { $0.append(status) }
+            }
+        }
+        try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
+        let second = Task {
+            try await client.receiver.launch(.defaultMediaReceiver, timeout: .milliseconds(100)) { status in
+                secondStatuses.withLock { $0.append(status) }
+            }
+        }
+        let launch = try #require(mock.sentMessages(ofType: "LAUNCH").first)
+        // Longer than the joined caller's own timeout, which it does not use.
+        try await Task.sleep(for: .milliseconds(300))
+        mock.reply(to: launch, ["type": "LAUNCH_STATUS", "status": "USER_ALLOWED"])
+        mock.reply(to: launch, Fixtures.receiverStatus(apps: [Fixtures.mediaApp]))
+        let firstApp = try await first.value
+        let secondApp = try await second.value
+        #expect(firstApp == secondApp)
+        #expect(firstApp.transportId == Fixtures.transportID)
+        #expect(mock.sentMessages(ofType: "LAUNCH").count == 1)
+        #expect(firstStatuses.withLock { $0 } == ["USER_ALLOWED"])
+        #expect(secondStatuses.withLock { $0 }.isEmpty)
+    }
+
+    @Test func concurrentLaunchOfAnotherAppThrowsRequestInFlight() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
         try await client.connect()
@@ -636,8 +667,49 @@ struct ClientTests {
         let app = try await first.value
         #expect(app.transportId == Fixtures.transportID)
         #expect(mock.sentMessages(ofType: "LAUNCH").count == 1)
+    }
+
+    @Test func launchAfterACompletedLaunchSendsAgain() async throws {
+        let mock = MockReceiver()
         Fixtures.installDefaultReceiver(on: mock)
+        let client = makeClient(mock)
+        try await client.connect()
         _ = try await client.receiver.launch(.defaultMediaReceiver)
+        _ = try await client.receiver.launch(.defaultMediaReceiver)
+        #expect(mock.sentMessages(ofType: "LAUNCH").count == 2)
+    }
+
+    @Test func cancellingAJoinedLaunchLeavesTheLaunchRunning() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let first = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
+        let joined = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        try await Task.sleep(for: .milliseconds(50))
+        joined.cancel()
+        let joinedResult = await joined.result
+        #expect(throws: CancellationError.self) { try joinedResult.get() }
+        let launch = try #require(mock.sentMessages(ofType: "LAUNCH").first)
+        mock.reply(to: launch, Fixtures.receiverStatus(apps: [Fixtures.mediaApp]))
+        let app = try await first.value
+        #expect(app.transportId == Fixtures.transportID)
+        #expect(mock.sentMessages(ofType: "LAUNCH").count == 1)
+    }
+
+    @Test func cancellingTheFirstLaunchCallerEndsTheLaunch() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let first = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
+        first.cancel()
+        let firstResult = await first.result
+        #expect(throws: (any Error).self) { try firstResult.get() }
+        Fixtures.installDefaultReceiver(on: mock)
+        let app = try await client.receiver.launch(.defaultMediaReceiver)
+        #expect(app.transportId == Fixtures.transportID)
+        #expect(mock.sentMessages(ofType: "LAUNCH").count == 2)
     }
 
     @Test func stopWhileStopPendingThrowsRequestInFlight() async throws {

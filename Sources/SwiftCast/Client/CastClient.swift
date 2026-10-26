@@ -111,6 +111,7 @@ public actor CastClient {
     private var nextRequestID = 1
     private var connectedDestinations: Set<String> = []
     private var connectsInFlight: [String: Task<Void, any Error>] = [:]
+    private var launchInFlight: (appID: CastAppID, task: Task<CastApplication, any Error>)?
     private var protocolVersions: [String: Int] = [:]
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
@@ -171,6 +172,7 @@ public actor CastClient {
         decoder = FrameDecoder()
         connectedDestinations = []
         connectsInFlight = [:]
+        launchInFlight = nil
         protocolVersions = [:]
 
         let transport = makeTransport()
@@ -422,6 +424,30 @@ public actor CastClient {
             application = try await receiver.launch(appID)
         }
         return try await mediaController(for: application)
+    }
+
+    /// Runs `start` as the client's one pending launch, or joins the pending
+    /// launch of the same app. Cancelling the caller that started it cancels
+    /// the launch for every caller. A cancelled joined caller throws
+    /// `CancellationError` straight away and leaves the launch running.
+    func coalescedLaunch(
+        _ appID: CastAppID,
+        _ start: @escaping @Sendable () async throws -> CastApplication
+    ) async throws -> CastApplication {
+        if let launchInFlight {
+            guard launchInFlight.appID == appID else { throw CastError.requestInFlight("LAUNCH") }
+            return try await joinedValue(of: launchInFlight.task)
+        }
+        let task = Task { try await start() }
+        launchInFlight = (appID, task)
+        defer {
+            if launchInFlight?.task == task { launchInFlight = nil }
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
     /// Convenience for ``launchMediaApp(_:)`` with the Default Media Receiver.
@@ -690,6 +716,7 @@ public actor CastClient {
         transport = nil
         connectedDestinations = []
         connectsInFlight = [:]
+        launchInFlight = nil
         protocolVersions = [:]
         let failures = pending
         pending = [:]
@@ -714,5 +741,42 @@ public actor CastClient {
         case "ERROR" where message.namespace == .media: return .mediaError(MediaErrorInfo(message))
         default: return nil
         }
+    }
+}
+
+private enum JoinState<Success: Sendable>: Sendable {
+    case waiting
+    case suspended(CheckedContinuation<Success, any Error>)
+    case finished
+}
+
+/// Waits for `task` without owning it, since `Task.value` ignores the
+/// waiter's cancellation: a cancelled waiter throws `CancellationError`
+/// promptly and `task` keeps running for its other callers.
+private func joinedValue<Success: Sendable>(of task: Task<Success, any Error>) async throws -> Success {
+    let state = OSAllocatedUnfairLock<JoinState<Success>>(initialState: .waiting)
+    return try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Success, any Error>) in
+            let cancelled = state.withLock { state -> Bool in
+                guard case .waiting = state else { return true }
+                state = .suspended(continuation)
+                return false
+            }
+            guard !cancelled else { return continuation.resume(throwing: CancellationError()) }
+            Task {
+                let result = await task.result
+                state.withLock { state -> CheckedContinuation<Success, any Error>? in
+                    guard case .suspended(let continuation) = state else { return nil }
+                    state = .finished
+                    return continuation
+                }?.resume(with: result)
+            }
+        }
+    } onCancel: {
+        state.withLock { state -> CheckedContinuation<Success, any Error>? in
+            defer { state = .finished }
+            guard case .suspended(let continuation) = state else { return nil }
+            return continuation
+        }?.resume(throwing: CancellationError())
     }
 }
