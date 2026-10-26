@@ -825,6 +825,50 @@ struct ClientTests {
         #expect(await !client.isConnected(to: Fixtures.transportID))
     }
 
+    @Test func concurrentConnectsToOneDestinationShareOneWrite() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let first = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let returns = Counter()
+        let second = Task {
+            try await client.openVirtualConnection(to: Fixtures.transportID)
+            _ = returns.increment()
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        let returnsBeforeRelease = returns.increment() - 1
+        #expect(returnsBeforeRelease == 0)
+        mock.releaseHeldSends()
+        try await first.value
+        try await second.value
+        #expect(mock.sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 1)
+        #expect(await client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func concurrentConnectsAllFailWhenTheWriteFails() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        mock.failSends(ofType: "CONNECT", with: .connectionFailed("broken pipe"))
+        let first = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let second = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await Task.sleep(for: .milliseconds(100))
+        mock.releaseHeldSends()
+        await #expect(throws: CastError.connectionFailed("broken pipe")) { try await first.value }
+        await #expect(throws: CastError.connectionFailed("broken pipe")) { try await second.value }
+        #expect(mock.sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 1)
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+
+        await #expect(throws: CastError.connectionFailed("broken pipe")) {
+            try await client.openVirtualConnection(to: Fixtures.transportID)
+        }
+        #expect(mock.sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 2)
+    }
+
     @Test func requestIDsAreSequentialPerClient() async throws {
         let mock = MockReceiver()
         Fixtures.installDefaultReceiver(on: mock)
