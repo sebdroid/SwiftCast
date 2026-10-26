@@ -11,6 +11,7 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         var sent: [InboundMessage] = []
         var handlers: [String: Handler] = [:]
         var openError: CastError?
+        var sendFailures: [String: CastError] = [:]
         var isOpen = false
     }
 
@@ -40,6 +41,12 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         state.withLock { $0.openError = error }
     }
 
+    /// Makes sends of messages of the given `type` throw `error`. The failed
+    /// message is still recorded in ``sentMessages``.
+    func failSends(ofType type: String, with error: CastError) {
+        state.withLock { $0.sendFailures[type] = error }
+    }
+
     // MARK: CastTransport
 
     func open() async throws {
@@ -51,10 +58,11 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         let output = state.withLock { $0.decoder.append(data) }
         for message in output.messages {
             let inbound = InboundMessage(message)
-            let handler = state.withLock { state -> Handler? in
+            let (handler, failure) = state.withLock { state -> (Handler?, CastError?) in
                 state.sent.append(inbound)
-                return inbound.type.flatMap { state.handlers[$0] }
+                return (inbound.type.flatMap { state.handlers[$0] }, inbound.type.flatMap { state.sendFailures[$0] })
             }
+            if let failure { throw failure }
             if inbound.namespace == .heartbeat, inbound.type == "PING", answersPings {
                 reply(to: inbound, ["type": "PONG"])
             }
