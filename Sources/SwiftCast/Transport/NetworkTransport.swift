@@ -4,9 +4,9 @@ import os
 
 /// A TLS connection to a Cast device using `Network.framework`.
 ///
-/// Cast devices present self-signed certificates, so peer certificate
-/// validation is disabled for this connection; the Cast protocol performs
-/// its own (optional) device authentication at the application layer.
+/// Cast devices present self-signed certificates, so TLS peer verification
+/// is disabled for this connection. Device authentication is not yet
+/// implemented, so peers are unauthenticated.
 public final class NetworkTransport: CastTransport, @unchecked Sendable {
     private enum OpenState {
         case idle

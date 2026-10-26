@@ -556,8 +556,9 @@ public struct MediaStatus: Codable, Sendable, Hashable {
     public var currentTime: Double?
     public var supportedMediaCommands: SupportedMediaCommands?
     public var volume: CastVolume?
-    /// Omitted by receivers when unchanged; ``MediaController`` fills it in
-    /// from the most recent status that included it.
+    /// Omitted by receivers when unchanged; ``MediaController`` keeps the
+    /// value from the most recent status that included it, as it does for
+    /// every other field a status leaves out.
     public var media: MediaInformation?
     public var activeTrackIds: [Int]?
     public var currentItemId: Int?
@@ -583,7 +584,7 @@ public struct MediaStatus: Codable, Sendable, Hashable {
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         mediaSessionId = try c.decode(Int.self, forKey: .mediaSessionId)
-        playerState = try c.decodeIfPresent(PlayerState.self, forKey: .playerState) ?? .idle
+        playerState = (try? c.decodeIfPresent(PlayerState.self, forKey: .playerState)) ?? .idle
         playbackRate = try? c.decodeIfPresent(Double.self, forKey: .playbackRate)
         idleReason = try? c.decodeIfPresent(IdleReason.self, forKey: .idleReason)
         currentTime = try? c.decodeIfPresent(Double.self, forKey: .currentTime)
@@ -612,5 +613,49 @@ public struct MediaStatus: Codable, Sendable, Hashable {
             return min(max(0, estimate), duration)
         }
         return max(0, estimate)
+    }
+}
+
+/// One decoded entry of a `MEDIA_STATUS` message.
+///
+/// Receivers send only what changed, so an entry is applied onto the cached
+/// status of the same media session: a field with a usable value replaces
+/// the cached one, and a missing, `null` or undecodable field keeps it.
+struct MediaStatusEntry: Decodable, Sendable {
+    let status: MediaStatus
+    let includesPlayerState: Bool
+
+    init(from decoder: any Decoder) throws {
+        status = try MediaStatus(from: decoder)
+        let c = try decoder.container(keyedBy: MediaStatus.CodingKeys.self)
+        // An unrecognised string still counts as present and is applied as
+        // `.unknown`; only a missing, `null` or non-string value keeps the cached state.
+        includesPlayerState = (try? c.decodeIfPresent(PlayerState.self, forKey: .playerState)) != nil
+    }
+
+    /// `elapsed` is the time since `cached` was received. A missing
+    /// `currentTime` is carried forward to the position estimated from it,
+    /// because the merged status is timed from now.
+    func applied(to cached: MediaStatus, elapsed: TimeInterval) -> MediaStatus {
+        var merged = status
+        merged.playbackRate = status.playbackRate ?? cached.playbackRate
+        merged.currentTime = status.currentTime ?? cached.estimatedTime(after: elapsed)
+        merged.supportedMediaCommands = status.supportedMediaCommands ?? cached.supportedMediaCommands
+        merged.volume = status.volume ?? cached.volume
+        merged.media = status.media ?? cached.media
+        merged.activeTrackIds = status.activeTrackIds ?? cached.activeTrackIds
+        merged.currentItemId = status.currentItemId ?? cached.currentItemId
+        merged.items = status.items ?? cached.items
+        merged.repeatMode = status.repeatMode ?? cached.repeatMode
+        merged.customData = status.customData ?? cached.customData
+        // idleReason, loadingItemId and preloadedItemId stay as sent: receivers
+        // drop them once they stop applying (idleReason outside IDLE, the ids
+        // once nothing is loading or preloaded). idleReason is only kept when
+        // the entry leaves the player state unchanged too.
+        if !includesPlayerState {
+            merged.playerState = cached.playerState
+            merged.idleReason = status.idleReason ?? cached.idleReason
+        }
+        return merged
     }
 }
