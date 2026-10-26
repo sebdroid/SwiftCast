@@ -5,10 +5,11 @@ import os
 
 /// Discovers Cast devices on the local network using Bonjour (`_googlecast._tcp`).
 ///
-/// On iOS, iPadOS, macOS and visionOS, local network privacy applies, so your
-/// app's Info.plist must include `NSLocalNetworkUsageDescription` and list
-/// `_googlecast._tcp` under `NSBonjourServices`. tvOS has no local network
-/// prompt and needs neither key. Sandboxed macOS apps also need the
+/// On iOS, iPadOS, visionOS and macOS 15 or later, local network privacy
+/// applies, so your app's Info.plist must include `NSLocalNetworkUsageDescription`
+/// and list `_googlecast._tcp` under `NSBonjourServices`. tvOS has no local
+/// network prompt and needs neither key, and command-line tools launched from
+/// Terminal are allowed automatically. Sandboxed macOS apps also need the
 /// `com.apple.security.network.client` entitlement.
 public enum CastDiscovery {
     /// The Bonjour service type advertised by Cast devices.
