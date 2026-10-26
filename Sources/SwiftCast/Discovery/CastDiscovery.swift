@@ -26,6 +26,15 @@ public enum CastDiscovery {
     /// Browses for devices. Each call starts an independent browser that
     /// stops when the consumer stops iterating.
     public static func events(domain: String? = nil) -> AsyncStream<Event> {
+        events(domain: domain, keeping: OSAllocatedUnfairLock(initialState: [:]))
+    }
+
+    /// Browses like ``events(domain:)``, recording each id's first chosen
+    /// endpoint in `chosen` so a caller that restarts browsing keeps them.
+    static func events(
+        domain: String? = nil,
+        keeping chosen: OSAllocatedUnfairLock<[String: NWEndpoint]>
+    ) -> AsyncStream<Event> {
         AsyncStream { continuation in
             let parameters = NWParameters()
             parameters.includePeerToPeer = false
@@ -44,7 +53,6 @@ public enum CastDiscovery {
                     break
                 }
             }
-            let chosen = OSAllocatedUnfairLock<[String: NWEndpoint]>(initialState: [:])
             browser.browseResultsChangedHandler = { results, _ in
                 let candidates = candidates(from: results)
                 let found = chosen.withLock { devices(from: candidates, keeping: &$0) }
@@ -244,19 +252,22 @@ public final class CastDeviceBrowser {
     /// Whether the browser is running.
     public private(set) var isBrowsing = false
 
-    private let events: @Sendable () -> AsyncStream<CastDiscovery.Event>
+    private let events: @Sendable (OSAllocatedUnfairLock<[String: NWEndpoint]>) -> AsyncStream<CastDiscovery.Event>
     private let sweepInterval: Duration
     private let clock = ContinuousClock()
     private var roster: DeviceRoster<ContinuousClock.Instant>
+    private let chosenEndpoints = OSAllocatedUnfairLock<[String: NWEndpoint]>(initialState: [:])
 
     public convenience init() {
-        self.init(gracePeriod: .seconds(30), sweepInterval: .seconds(5)) { CastDiscovery.events() }
+        self.init(gracePeriod: .seconds(30), sweepInterval: .seconds(5)) { CastDiscovery.events(keeping: $0) }
     }
 
+    /// `events` receives the browser's chosen endpoint map, which outlives each
+    /// ``run()`` so a restart cannot hand a known id to a lookalike.
     init(
         gracePeriod: Duration,
         sweepInterval: Duration,
-        events: @escaping @Sendable () -> AsyncStream<CastDiscovery.Event>
+        events: @escaping @Sendable (OSAllocatedUnfairLock<[String: NWEndpoint]>) -> AsyncStream<CastDiscovery.Event>
     ) {
         self.events = events
         self.sweepInterval = sweepInterval
@@ -277,7 +288,7 @@ public final class CastDeviceBrowser {
             sweeper.cancel()
             isBrowsing = false
         }
-        for await event in events() {
+        for await event in events(chosenEndpoints) {
             switch event {
             case .devices(let found):
                 roster.update(found, at: clock.now)

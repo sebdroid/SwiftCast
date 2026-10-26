@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os
 import Testing
 @testable import SwiftCast
 
@@ -234,7 +235,7 @@ struct DiscoveryTests {
     @MainActor
     @Test func browserExpiresDevicesAfterTheGracePeriod() async throws {
         let (stream, continuation) = AsyncStream.makeStream(of: CastDiscovery.Event.self)
-        let browser = CastDeviceBrowser(gracePeriod: .seconds(1), sweepInterval: .milliseconds(20)) { stream }
+        let browser = CastDeviceBrowser(gracePeriod: .seconds(1), sweepInterval: .milliseconds(20)) { _ in stream }
         let run = Task { await browser.run() }
         defer { run.cancel() }
 
@@ -257,6 +258,32 @@ struct DiscoveryTests {
         continuation.finish()
         await run.value
         #expect(!browser.isBrowsing)
+    }
+
+    @MainActor
+    @Test func browserKeepsChosenEndpointsAcrossRestarts() async throws {
+        func candidate(_ serviceName: String, id: String = "X") -> CastDiscovery.BrowseCandidate {
+            .init(device: device(id: id, name: serviceName, service: serviceName), interfaceTypes: [.wifi], interfaceNames: ["en0"])
+        }
+        let fixtures = OSAllocatedUnfairLock(initialState: [
+            [candidate("Living-Room")],
+            [candidate("0"), candidate("Living-Room"), candidate("Kitchen", id: "Y")],
+        ])
+        let browser = CastDeviceBrowser(gracePeriod: .seconds(30), sweepInterval: .seconds(30)) { chosen in
+            let candidates = fixtures.withLock { $0.removeFirst() }
+            let found = chosen.withLock { CastDiscovery.devices(from: candidates, keeping: &$0) }
+            return AsyncStream { $0.yield(.devices(found)) }
+        }
+
+        let first = Task { await browser.run() }
+        try await waitUntil { browser.devices.map(\.endpoint) == [service("Living-Room")] }
+        first.cancel()
+        await first.value
+
+        let second = Task { await browser.run() }
+        defer { second.cancel() }
+        try await waitUntil { browser.devices.count == 2 }
+        #expect(browser.devices.first { $0.id == "X" }?.endpoint == service("Living-Room"))
     }
 
     @MainActor
