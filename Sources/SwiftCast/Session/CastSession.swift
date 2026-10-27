@@ -99,11 +99,14 @@ public final class CastSession {
     @ObservationIgnored private var pendingAttach: (sessionID: String, task: Task<MediaController, any Error>)?
     /// The application session last attached to, kept across reconnects so
     /// ``AutoJoinPolicy/sameSession`` can recognise it.
-    @ObservationIgnored private var attachedSessionID: String?
+    @ObservationIgnored private(set) var attachedSessionID: String?
     @ObservationIgnored private var rejoinTask: Task<Void, Never>?
     @ObservationIgnored private var rejoinGeneration = 0
     @ObservationIgnored private var epoch = 0
     @ObservationIgnored private let makeClient: @Sendable (CastDevice) -> CastClient
+
+    /// Whether a rejoin is polling for the remembered application, for tests.
+    var isRejoining: Bool { rejoinTask != nil }
 
     public init(appID: CastAppID = .defaultMediaReceiver) {
         self.appID = appID
@@ -292,7 +295,9 @@ public final class CastSession {
                 } else {
                     // While a rejoin runs, the receiver may not list the app
                     // yet, so only a status seen outside one ends the session.
-                    if self.rejoinTask == nil || self.mediaController != nil {
+                    // Attaching ends a rejoin, so this also covers a controller
+                    // that has already detached itself on this same status.
+                    if self.rejoinTask == nil {
                         self.attachedSessionID = nil
                     }
                     if self.mediaController != nil { self.detachMedia() }
@@ -323,7 +328,12 @@ public final class CastSession {
             defer { if let self, self.rejoinGeneration == generation { self.rejoinTask = nil } }
             while await self?.attemptRejoin(client: client, epoch: currentEpoch) == false {
                 let next = ContinuousClock.now.advanced(by: interval)
-                guard next <= deadline else { return }
+                guard next <= deadline else {
+                    // The app did not come back, so a later loss has nothing to
+                    // rejoin. Whatever ends a rejoin early cancels it first.
+                    if let self, !Task.isCancelled { self.attachedSessionID = nil }
+                    return
+                }
                 try? await Task.sleep(until: next, clock: .continuous)
                 if Task.isCancelled { return }
             }
@@ -397,10 +407,12 @@ public final class CastSession {
         pendingAttach = (app.sessionId, task)
         defer { if pendingAttach?.sessionID == app.sessionId { pendingAttach = nil } }
         let controller = try await task.value
-        guard currentEpoch == epoch else { throw CastError.notConnected }
+        guard currentEpoch == epoch, self.client === client else { throw CastError.notConnected }
         mediaTask?.cancel()
         mediaController = controller
         attachedSessionID = app.sessionId
+        rejoinTask?.cancel()
+        rejoinTask = nil
         let updates = await controller.statusUpdates()
         mediaTask = Task { [weak self] in
             for await status in updates {

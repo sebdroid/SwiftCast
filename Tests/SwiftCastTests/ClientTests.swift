@@ -1433,13 +1433,17 @@ struct ClientTests {
 }
 
 /// Polls `condition` until it holds or the deadline passes.
-func eventually(timeout: Duration = .seconds(5), _ condition: @Sendable () async -> Bool) async throws {
+func eventually(
+    timeout: Duration = .seconds(5),
+    sourceLocation: SourceLocation = #_sourceLocation,
+    _ condition: @Sendable () async -> Bool
+) async throws {
     let deadline = ContinuousClock.now + timeout
     while ContinuousClock.now < deadline {
         if await condition() { return }
         try await Task.sleep(for: .milliseconds(10))
     }
-    Issue.record("Condition not met within \(timeout)")
+    Issue.record("Condition not met within \(timeout)", sourceLocation: sourceLocation)
 }
 
 final class Counter: @unchecked Sendable {
