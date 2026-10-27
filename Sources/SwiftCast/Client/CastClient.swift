@@ -88,6 +88,13 @@ public actor CastClient {
         let requestID: Int
     }
 
+    private struct LaunchInFlight {
+        let id: Int
+        let appID: CastAppID
+        let task: Task<CastApplication, any Error>
+        var waiters = 1
+    }
+
     private struct PendingRequest {
         let continuation: CheckedContinuation<InboundMessage, any Error>
         let timeoutTask: Task<Void, Never>
@@ -114,8 +121,11 @@ public actor CastClient {
     private var nextRequestID = 1
     private var connectedDestinations: Set<String> = []
     private var connectsInFlight: [String: Task<Void, any Error>] = [:]
-    private var launchInFlight: (appID: CastAppID, task: Task<CastApplication, any Error>)?
+    private var launchInFlight: LaunchInFlight?
+    private var nextLaunchID = 0
     private var protocolVersions: [String: Int] = [:]
+    /// The timeout the latest request of each payload `type` was given, for tests.
+    private(set) var lastTimeoutByRequestType: [String: Duration] = [:]
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var nextPing = ContinuousClock.now
@@ -323,6 +333,7 @@ public actor CastClient {
         object["requestId"] = .number(Double(requestID))
         let message = try Self.makeMessage(JSONValue.object(object), source: senderID, namespace: namespace, destination: destination)
         let timeout = timeout ?? configuration.requestTimeout
+        if let type { lastTimeoutByRequestType[type] = timeout }
 
         let response = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<InboundMessage, any Error>) in
@@ -425,6 +436,10 @@ public actor CastClient {
 
     /// Joins `appID` if it is already running, otherwise launches it, and
     /// returns a media controller for it.
+    ///
+    /// A launch shared with other callers (see ``ReceiverController/launch(_:timeout:onStatus:)``)
+    /// is cancelled only when every caller waiting on it has been cancelled;
+    /// a cancelled call throws `CancellationError` straight away.
     public func launchMediaApp(_ appID: CastAppID = .defaultMediaReceiver) async throws -> MediaController {
         let status = try await receiver.getStatus()
         let application: CastApplication
@@ -437,26 +452,58 @@ public actor CastClient {
     }
 
     /// Runs `start` as the client's one pending launch, or joins the pending
-    /// launch of the same app. Cancelling the caller that started it cancels
-    /// the launch for every caller. A cancelled joined caller throws
-    /// `CancellationError` straight away and leaves the launch running.
+    /// launch of the same app. A cancelled caller, whether it started the
+    /// launch or joined it, throws `CancellationError` straight away and
+    /// stops waiting; the launch itself is cancelled only when every caller
+    /// waiting on it has been cancelled.
     func coalescedLaunch(
         _ appID: CastAppID,
         _ start: @escaping @Sendable () async throws -> CastApplication
     ) async throws -> CastApplication {
+        let id: Int
+        let task: Task<CastApplication, any Error>
         if let launchInFlight {
             guard launchInFlight.appID == appID else { throw CastError.requestInFlight("LAUNCH") }
-            return try await joinedValue(of: launchInFlight.task)
+            id = launchInFlight.id
+            task = launchInFlight.task
+            self.launchInFlight?.waiters += 1
+        } else {
+            nextLaunchID += 1
+            id = nextLaunchID
+            // Cleared from inside the task so no caller can join it once it has finished.
+            task = Task { [weak self] in
+                do {
+                    let application = try await start()
+                    await self?.endLaunch(id)
+                    return application
+                } catch {
+                    await self?.endLaunch(id)
+                    throw error
+                }
+            }
+            launchInFlight = LaunchInFlight(id: id, appID: appID, task: task)
         }
-        let task = Task { try await start() }
-        launchInFlight = (appID, task)
-        defer {
-            if launchInFlight?.task == task { launchInFlight = nil }
-        }
-        return try await withTaskCancellationHandler {
-            try await task.value
-        } onCancel: {
-            task.cancel()
+        defer { leaveLaunch(id) }
+        return try await joinedValue(of: task)
+    }
+
+    /// The task of the pending launch, for tests.
+    var pendingLaunch: Task<CastApplication, any Error>? { launchInFlight?.task }
+
+    private func endLaunch(_ id: Int) {
+        if launchInFlight?.id == id { launchInFlight = nil }
+    }
+
+    /// A launch still pending when its last waiter leaves has only cancelled
+    /// waiters, since a finished launch clears itself before its result is delivered.
+    private func leaveLaunch(_ id: Int) {
+        guard launchInFlight?.id == id, var launch = launchInFlight else { return }
+        launch.waiters -= 1
+        if launch.waiters == 0 {
+            launchInFlight = nil
+            launch.task.cancel()
+        } else {
+            launchInFlight = launch
         }
     }
 

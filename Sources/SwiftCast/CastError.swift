@@ -17,8 +17,7 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
     /// An outbound message body of the given byte count exceeds the Cast frame limit.
     case messageTooLarge(Int)
     /// The receiver refused to launch an application, or its reply did not
-    /// list the application. See ``launchErrorReason`` for the documented
-    /// receiver codes.
+    /// list the application. See ``launchErrorReason`` for the typed reasons.
     case launchFailed(reason: String?)
     /// A request payload was rejected locally, before anything was sent.
     case invalidPayload(String)
@@ -80,7 +79,7 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
     }
 
     /// The reason a ``launchFailed(reason:)`` error carries, typed so the
-    /// documented receiver codes can be matched without comparing strings.
+    /// known codes can be matched without comparing strings.
     public var launchErrorReason: LaunchErrorReason? {
         guard case .launchFailed(let reason?) = self else { return nil }
         return LaunchErrorReason(rawValue: reason)
@@ -91,21 +90,26 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
     }
 }
 
-/// The reason a receiver gives in a `LAUNCH_ERROR` reply, taken from its
-/// `extendedError`, else its `error`, else its `reason` field.
+/// Why a launch failed: the reason a receiver gives in a `LAUNCH_ERROR`
+/// reply, taken from its `extendedError`, else its `error`, else its
+/// `reason` field, or ``applicationNotListed``.
 public enum LaunchErrorReason: OpenStringEnum {
     /// The user declined the launch prompt on the device.
     case userNotAllowed
     /// The device could not ask the user because its launch prompts are turned off.
     case notificationDisabled
+    /// Produced locally, not by a receiver: the reply to the launch listed
+    /// no matching application.
+    case applicationNotListed
     case unknown(String)
 
-    public static let knownCases: [LaunchErrorReason] = [.userNotAllowed, .notificationDisabled]
+    public static let knownCases: [LaunchErrorReason] = [.userNotAllowed, .notificationDisabled, .applicationNotListed]
 
     public var rawValue: String {
         switch self {
         case .userNotAllowed: "USER_NOT_ALLOWED"
         case .notificationDisabled: "NOTIFICATION_DISABLED"
+        case .applicationNotListed: "APPLICATION_NOT_LISTED"
         case .unknown(let value): value
         }
     }

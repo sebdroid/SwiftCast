@@ -34,9 +34,9 @@ public struct ReceiverController: Sendable {
     /// same application meanwhile joins the pending launch instead of sending
     /// another `LAUNCH`: it shares that launch's reply, timeout and result,
     /// and its own `timeout` and `onStatus` are ignored, so only the first
-    /// caller sees `LAUNCH_STATUS` updates. Cancelling the first caller
-    /// cancels the launch for every caller; cancelling a joined caller only
-    /// makes that call throw `CancellationError`. A call for a different
+    /// caller sees `LAUNCH_STATUS` updates. A cancelled call throws
+    /// `CancellationError` straight away, and the launch is cancelled only
+    /// when every caller waiting on it has been cancelled. A call for a different
     /// application meanwhile throws ``CastError/requestInFlight(_:)``. If the application
     /// is already running it is relaunched by the receiver; use
     /// ``CastClient/launchMediaApp(_:)`` to join instead.
@@ -74,7 +74,7 @@ public struct ReceiverController: Sendable {
         )
         let status = try decodeStatus(response)
         guard let app = status.applications?.first(where: { $0.appId == appID && $0.transportId != CastEndpoint.platformReceiver }) else {
-            throw CastError.launchFailed(reason: "application not listed after launch")
+            throw CastError.launchFailed(reason: LaunchErrorReason.applicationNotListed.rawValue)
         }
         return app
     }
