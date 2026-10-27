@@ -419,6 +419,25 @@ struct SessionTests {
         await session.disconnect()
     }
 
+    @Test func reconnectsReleaseThePreviousClients() async throws {
+        let mocks = (0..<4).map { _ in MockReceiver() }
+        mocks.forEach { Fixtures.installDefaultReceiver(on: $0, appRunning: true) }
+        let log = ClientLog(mocks)
+        let session = CastSession { log.makeClient($0) }
+        session.reconnectPolicy = CastSession.ReconnectPolicy(attemptInterval: .milliseconds(20), window: .seconds(5))
+        try await session.connect(to: device)
+
+        for (index, mock) in mocks.dropLast().enumerated() {
+            mock.drop(with: CastError.connectionFailed("reset"))
+            try await reconnected(session)
+            try await eventually { await MainActor.run { session.mediaController != nil } }
+            try await eventually { (await log.client(at: index)?.observationSubscriberCount ?? 0) == 0 }
+        }
+        #expect(log.count == mocks.count)
+        try await eventually { (0..<mocks.count - 1).allSatisfy { log.client(at: $0) == nil } }
+        #expect(log.client(at: mocks.count - 1) === session.client)
+    }
+
     @Test func failedStatusDuringConnectLeavesNoClientBehind() async throws {
         let mock = MockReceiver()
         mock.on("GET_STATUS") { request, mock in
@@ -534,3 +553,33 @@ final class AttemptLog: @unchecked Sendable {
     var count: Int { instants.count }
 }
 
+/// Creates a client per mock in turn and keeps only a weak reference to each.
+final class ClientLog: @unchecked Sendable {
+    private struct Entry { weak var client: CastClient? }
+
+    private let lock = NSLock()
+    private let mocks: [MockReceiver]
+    private var entries: [Entry] = []
+
+    init(_ mocks: [MockReceiver]) {
+        self.mocks = mocks
+    }
+
+    func makeClient(_: CastDevice) -> CastClient {
+        lock.lock(); defer { lock.unlock() }
+        let mock = mocks[min(entries.count, mocks.count - 1)]
+        let client = CastClient { mock }
+        entries.append(Entry(client: client))
+        return client
+    }
+
+    func client(at index: Int) -> CastClient? {
+        lock.lock(); defer { lock.unlock() }
+        return entries[index].client
+    }
+
+    var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return entries.count
+    }
+}

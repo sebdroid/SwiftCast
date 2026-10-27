@@ -218,6 +218,7 @@ public actor CastClient {
             self.transport = nil
             transport.close()
             setState(.closed(castError))
+            finishStreams()
             throw error is CancellationError ? error : castError
         }
         guard generation == currentGeneration else {
@@ -271,11 +272,18 @@ public actor CastClient {
     // MARK: - Observation
 
     /// Streams connection state changes, starting with the current state.
+    ///
+    /// A stream made before the connection closes ends right after it
+    /// delivers the `.closed` state. To follow a reconnect, subscribe again
+    /// after calling ``connect()``.
     public func stateUpdates() -> AsyncStream<State> {
         stateBroadcaster.subscribe(initial: state)
     }
 
     /// Streams receiver status updates, starting with the latest known status.
+    ///
+    /// A stream made before the connection closes ends when it closes.
+    /// To follow a reconnect, subscribe again after calling ``connect()``.
     public func receiverStatusUpdates() -> AsyncStream<ReceiverStatus> {
         receiverStatusBroadcaster.subscribe(initial: receiverStatus)
     }
@@ -874,7 +882,20 @@ public actor CastClient {
             request.continuation.resume(throwing: error ?? CastError.notConnected)
         }
         setState(.closed(error))
+        finishStreams()
+    }
+
+    /// Ends every current subscription once `.closed` has been yielded, so a
+    /// watcher left on a dead connection does not keep the client alive.
+    private func finishStreams() {
         messageBroadcaster.finishAll()
+        stateBroadcaster.finishAll()
+        receiverStatusBroadcaster.finishAll()
+    }
+
+    /// How many ``stateUpdates()`` and ``receiverStatusUpdates()`` streams are open, for tests.
+    var observationSubscriberCount: Int {
+        stateBroadcaster.subscriberCount + receiverStatusBroadcaster.subscriberCount
     }
 
     static func standardError(in message: InboundMessage) -> CastError? {

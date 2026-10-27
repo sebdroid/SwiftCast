@@ -92,7 +92,8 @@ public final class CastSession {
     /// The media controller for ``appID`` once it is running.
     public private(set) var mediaController: MediaController?
 
-    @ObservationIgnored private var connectionTasks: [Task<Void, Never>] = []
+    @ObservationIgnored private var stateTask: Task<Void, Never>?
+    @ObservationIgnored private var receiverStatusTask: Task<Void, Never>?
     @ObservationIgnored private var mediaTask: Task<Void, Never>?
     /// In-flight attach, shared so concurrent callers (a load and a receiver
     /// status update) don't create competing controllers for one application.
@@ -270,7 +271,9 @@ public final class CastSession {
     }
 
     private func observe(_ client: CastClient, device: CastDevice, epoch currentEpoch: Int) {
-        let stateTask = Task { [weak self] in
+        stateTask?.cancel()
+        receiverStatusTask?.cancel()
+        stateTask = Task { [weak self] in
             for await state in await client.stateUpdates() {
                 guard let self, currentEpoch == self.epoch else { return }
                 if case .closed(let error?) = state {
@@ -279,7 +282,7 @@ public final class CastSession {
                 }
             }
         }
-        let receiverTask = Task { [weak self] in
+        receiverStatusTask = Task { [weak self] in
             for await update in await client.receiverStatusUpdates() {
                 guard let self, currentEpoch == self.epoch else { return }
                 // Stream elements can be delivered after newer statuses have
@@ -304,7 +307,6 @@ public final class CastSession {
                 }
             }
         }
-        connectionTasks = [stateTask, receiverTask]
     }
 
     private func allowsAutoAttach(to app: CastApplication) -> Bool {
@@ -351,6 +353,11 @@ public final class CastSession {
     }
 
     private func connectionLost(device: CastDevice, error: CastError, epoch lostEpoch: Int) async {
+        // This runs on the state watcher, which returns as soon as this does,
+        // so it is released rather than cancelled.
+        stateTask = nil
+        receiverStatusTask?.cancel()
+        receiverStatusTask = nil
         rejoinTask?.cancel()
         detachMedia()
         client = nil
@@ -446,8 +453,10 @@ public final class CastSession {
     }
 
     private func teardown(stopApplication: Bool) async {
-        connectionTasks.forEach { $0.cancel() }
-        connectionTasks = []
+        stateTask?.cancel()
+        stateTask = nil
+        receiverStatusTask?.cancel()
+        receiverStatusTask = nil
         rejoinTask?.cancel()
         rejoinTask = nil
         attachedSessionID = nil
