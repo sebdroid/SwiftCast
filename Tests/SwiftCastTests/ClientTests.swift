@@ -173,7 +173,6 @@ struct ClientTests {
         try await eventually { await client.state != .connected }
         #expect(await client.state == .closed(.heartbeatTimeout))
         #expect(mock.sentMessages(ofType: "PING").count >= 1)
-        mock.releaseHeldSends()
     }
 
     @Test func anyInboundTrafficKeepsConnectionAlive() async throws {
@@ -216,6 +215,76 @@ struct ClientTests {
         mock.push(["type": "PING"], namespace: .heartbeat)
         try await eventually { await client.state != .connected }
         #expect(await client.state == .closed(.connectionFailed("heartbeat write failed: broken pipe")))
+    }
+
+    @Test func lateHeartbeatWriteFailureLeavesReconnectedClientAlone() async throws {
+        let first = MockReceiver()
+        first.holdSends(ofType: "PING")
+        first.failsHeldSendsOnClose = false
+        let mocks = [first, MockReceiver()]
+        let index = Counter()
+        var configuration = CastClient.Configuration()
+        configuration.heartbeatInterval = .milliseconds(50)
+        configuration.inactivityTimeout = .milliseconds(150)
+        let client = CastClient(configuration: configuration) { mocks[index.increment() - 1] }
+
+        try await client.connect()
+        try await eventually { await client.state != .connected }
+        #expect(await client.state == .closed(.heartbeatTimeout))
+        let heldPings = first.sentMessages(ofType: "PING").count
+        #expect(heldPings >= 1)
+
+        try await client.connect()
+        let states = await client.stateUpdates()
+        first.releaseHeldSends()
+        try await eventually { mocks[1].sentMessages(ofType: "PING").count >= 3 }
+        #expect(await client.state == .connected)
+        #expect(mocks[1].isOpen)
+
+        await client.disconnect()
+        var seen: [CastClient.State] = []
+        for await state in states {
+            seen.append(state)
+            if case .closed = state { break }
+        }
+        #expect(seen == [.connected, .closed(nil)])
+    }
+
+    @Test func inactivityCloseWakesAtTheDeadlineNotTheNextTick() async throws {
+        let mock = MockReceiver()
+        mock.answersPings = false
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(400)
+            $0.inactivityTimeout = .milliseconds(500)
+        }
+        try await client.connect()
+        let start = ContinuousClock.now
+        try await eventually { await client.state != .connected }
+        let elapsed = ContinuousClock.now - start
+        #expect(await client.state == .closed(.heartbeatTimeout))
+        // The first PING at 400 ms arms a deadline at 900 ms; the tick after
+        // that deadline would be at 1200 ms.
+        #expect(elapsed < .milliseconds(1100))
+    }
+
+    @Test func nonPositiveIntervalUsesTheDefaultCadence() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock) { $0.heartbeatInterval = .zero }
+        try await client.connect()
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(mock.sentMessages(ofType: "PING").count <= 1)
+        #expect(await client.state == .connected)
+    }
+
+    @Test func nonPositiveTimeoutUsesTheDefault() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(30)
+            $0.inactivityTimeout = .zero
+        }
+        try await client.connect()
+        try await eventually { mock.sentMessages(ofType: "PING").count >= 5 }
+        #expect(await client.state == .connected)
     }
 
     @Test func defaultTimeouts() {
@@ -755,8 +824,8 @@ struct ClientTests {
         let index = Counter()
         let client = CastClient { mocks[min(index.increment(), mocks.count) - 1] }
         try await client.connect()
+        mocks[0].failsHeldSendsOnClose = false
         mocks[0].holdSends(ofType: "CONNECT")
-        mocks[0].failSends(ofType: "CONNECT", with: .connectionFailed("broken pipe"))
         let staleOpen = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
         try await eventually { mocks[0].sentMessages(ofType: "CONNECT").count == 2 }
 
@@ -766,7 +835,7 @@ struct ClientTests {
         try await client.openVirtualConnection(to: Fixtures.transportID)
 
         mocks[0].releaseHeldSends()
-        await #expect(throws: CastError.connectionFailed("broken pipe")) { try await staleOpen.value }
+        await #expect(throws: MockReceiver.cancelledSendError) { try await staleOpen.value }
         #expect(await client.isConnected(to: Fixtures.transportID))
     }
 
