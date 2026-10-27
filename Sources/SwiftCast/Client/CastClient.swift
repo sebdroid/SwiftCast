@@ -422,7 +422,8 @@ public actor CastClient {
     /// Does nothing if one is already open. A call made while another is still
     /// opening the same connection waits for it and shares its result, then
     /// opens again if the connection was closed before it resumed and no later
-    /// open or close has been issued.
+    /// open or close has been issued. A waiting call throws
+    /// ``CastError/notConnected`` if the client disconnected while it waited.
     public func openVirtualConnection(to destination: String) async throws {
         try await openConnection(to: destination)
     }
@@ -433,15 +434,16 @@ public actor CastClient {
     @discardableResult
     private func openConnection(to destination: String) async throws -> Int? {
         let intent = recordIntent(for: destination)
-        for _ in 0..<2 {
-            guard let inFlight = connectsInFlight[destination] else { break }
-            let generation = generation
+        let generation = generation
+        // Every join re-checks before looping, so the write below only ever
+        // runs with no open in flight, on the connection this call began on,
+        // and with no later open or close issued.
+        while let inFlight = connectsInFlight[destination] {
             try await inFlight.write.value
-            guard self.generation == generation, virtualConnectionIntents[destination] == intent,
-                  !connectedDestinations.contains(destination) else { return nil }
+            guard self.generation == generation else { throw CastError.notConnected }
+            guard virtualConnectionIntents[destination] == intent, !connectedDestinations.contains(destination) else { return nil }
         }
         guard !connectedDestinations.contains(destination) else { return nil }
-        let generation = generation
         // Registered before the write so a message the peer sends as soon as
         // it sees CONNECT is not dropped as coming from an unknown peer.
         connectedDestinations.insert(destination)
@@ -1050,37 +1052,60 @@ private final class LaunchWaiter: Sendable {
 /// `Task.value` ignores the waiter's cancellation, so a cancelled waiter is
 /// resumed and dropped here at once instead of lingering until the write ends.
 private final class OpenCompletion: Sendable {
+    private enum Waiter: Sendable {
+        case starting
+        case cancelledBeforeStart
+        case waiting(CheckedContinuation<Void, any Error>)
+    }
+
     private struct State: Sendable {
         var result: Result<Void, any Error>?
-        var waiters: [Int: CheckedContinuation<Void, any Error>] = [:]
-        var cancelled: Set<Int> = []
+        // An entry lives from `wait()` until its continuation is resumed, so
+        // a cancellation that lands after `finish` finds nothing to record.
+        var waiters: [Int: Waiter] = [:]
         var nextID = 0
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
 
-    var waiterCount: Int { state.withLock { $0.waiters.count } }
+    var waiterCount: Int {
+        state.withLock { state in
+            state.waiters.values.count { if case .waiting = $0 { true } else { false } }
+        }
+    }
 
     func finish(_ result: Result<Void, any Error>) {
-        let waiters = state.withLock { state in
+        let resumed = state.withLock { state in
             state.result = result
-            defer { state.waiters = [:] }
-            return Array(state.waiters.values)
+            var resumed: [CheckedContinuation<Void, any Error>] = []
+            for (id, waiter) in state.waiters {
+                guard case .waiting(let continuation) = waiter else { continue }
+                state.waiters[id] = nil
+                resumed.append(continuation)
+            }
+            return resumed
         }
-        for waiter in waiters { waiter.resume(with: result) }
+        for continuation in resumed { continuation.resume(with: result) }
     }
 
     func wait() async throws {
         let id = state.withLock { state in
             defer { state.nextID += 1 }
+            state.waiters[state.nextID] = .starting
             return state.nextID
         }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                 let ready = state.withLock { state -> Result<Void, any Error>? in
-                    if state.cancelled.remove(id) != nil { return .failure(CancellationError()) }
-                    if let result = state.result { return result }
-                    state.waiters[id] = continuation
+                    if case .cancelledBeforeStart? = state.waiters[id] {
+                        state.waiters[id] = nil
+                        return .failure(CancellationError())
+                    }
+                    if let result = state.result {
+                        state.waiters[id] = nil
+                        return result
+                    }
+                    state.waiters[id] = .waiting(continuation)
                     return nil
                 }
                 if let ready { continuation.resume(with: ready) }
@@ -1089,9 +1114,16 @@ private final class OpenCompletion: Sendable {
             // Each continuation is taken out under the lock exactly once, by
             // either this handler or `finish`, so it is never resumed twice.
             state.withLock { state -> CheckedContinuation<Void, any Error>? in
-                if let waiter = state.waiters.removeValue(forKey: id) { return waiter }
-                state.cancelled.insert(id)
-                return nil
+                switch state.waiters[id] {
+                case .waiting(let continuation)?:
+                    state.waiters[id] = nil
+                    return continuation
+                case .starting?:
+                    state.waiters[id] = .cancelledBeforeStart
+                    return nil
+                case .cancelledBeforeStart?, nil:
+                    return nil
+                }
             }?.resume(throwing: CancellationError())
         }
     }
