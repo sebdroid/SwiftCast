@@ -44,15 +44,14 @@ public final class CastSession {
         public var attemptInterval: Duration
         /// How long after the loss attempts may start. Once no further
         /// attempt fits, the session moves to ``ConnectionState/failed(_:_:)``.
+        /// Every loss gets at least one attempt, even when `window` is
+        /// shorter than `attemptInterval`.
         public var window: Duration
 
         var rejoinInterval: Duration = .seconds(1)
         var rejoinWindow: Duration = .seconds(15)
 
-        /// - Precondition: `window` is at least `attemptInterval`, so every
-        ///   loss gets at least one attempt before the session fails.
         public init(attemptInterval: Duration = .seconds(3), window: Duration = .seconds(40)) {
-            precondition(window >= attemptInterval, "reconnect window must allow at least one attempt")
             self.attemptInterval = attemptInterval
             self.window = window
         }
@@ -102,6 +101,7 @@ public final class CastSession {
     /// ``AutoJoinPolicy/sameSession`` can recognise it.
     @ObservationIgnored private var attachedSessionID: String?
     @ObservationIgnored private var rejoinTask: Task<Void, Never>?
+    @ObservationIgnored private var rejoinGeneration = 0
     @ObservationIgnored private var epoch = 0
     @ObservationIgnored private let makeClient: @Sendable (CastDevice) -> CastClient
 
@@ -281,9 +281,13 @@ public final class CastSession {
                     if self.mediaController == nil, self.allowsAutoAttach(to: app) {
                         _ = try? await self.attachMedia(to: app, client: client, epoch: currentEpoch)
                     }
-                } else if self.mediaController != nil {
-                    self.attachedSessionID = nil
-                    self.detachMedia()
+                } else {
+                    // While a rejoin runs, the receiver may not list the app
+                    // yet, so only a status seen outside one ends the session.
+                    if self.rejoinTask == nil || self.mediaController != nil {
+                        self.attachedSessionID = nil
+                    }
+                    if self.mediaController != nil { self.detachMedia() }
                 }
             }
         }
@@ -305,7 +309,10 @@ public final class CastSession {
         rejoinTask?.cancel()
         let interval = reconnectPolicy.rejoinInterval
         let deadline = ContinuousClock.now.advanced(by: reconnectPolicy.rejoinWindow)
+        rejoinGeneration += 1
+        let generation = rejoinGeneration
         rejoinTask = Task { [weak self] in
+            defer { if let self, self.rejoinGeneration == generation { self.rejoinTask = nil } }
             while await self?.attemptRejoin(client: client, epoch: currentEpoch) == false {
                 let next = ContinuousClock.now.advanced(by: interval)
                 guard next <= deadline else { return }

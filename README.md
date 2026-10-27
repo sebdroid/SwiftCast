@@ -156,7 +156,10 @@ struct PlayerView: View {
 ```
 
 `CastSession` publishes `connectionState`, `receiverStatus`, `mediaStatus`, `volume`, `isPlaying`
-and `duration`. It reconnects after network blips and re-attaches to the running app.
+and `duration`. It reconnects after network blips and re-attaches to the running app. Which app
+sessions it re-attaches to is set by `autoJoinPolicy`: `.sameSession` (the default) only rejoins the
+session it was attached to, `.sameApp` joins any running instance of `appID`, and `.never` leaves
+joining to you.
 
 ### Media
 
