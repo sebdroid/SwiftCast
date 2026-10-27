@@ -395,7 +395,8 @@ public actor CastClient {
     /// then `CLOSE`. If that open fails, or another open or close of the same
     /// destination is issued while it waits, it does nothing: the later call
     /// decides the outcome. A close cancelled while it waits returns at once
-    /// and changes nothing: the connection stays as the open leaves it.
+    /// and changes nothing: the connection stays as the open leaves it, and
+    /// it does not count as a later call for closes that are still waiting.
     public func closeVirtualConnection(to destination: String) async {
         let intent = recordIntent(for: destination)
         if let inFlight = connectsInFlight[destination] {
@@ -405,6 +406,12 @@ public actor CastClient {
             do {
                 try await inFlight.completion.wait()
             } catch {
+                // A cancelled close decides nothing, so it must not supersede
+                // an earlier close still waiting. Only the latest call can be
+                // undone, so a later call keeps superseding as before.
+                if error is CancellationError, virtualConnectionIntents[destination] == intent {
+                    virtualConnectionIntents[destination] = intent - 1
+                }
                 return
             }
             guard self.generation == generation, virtualConnectionIntents[destination] == intent else { return }
