@@ -422,8 +422,10 @@ public actor CastClient {
     /// Does nothing if one is already open. A call made while another is still
     /// opening the same connection waits for it and shares its result, then
     /// opens again if the connection was closed before it resumed and no later
-    /// open or close has been issued. A waiting call throws
-    /// ``CastError/notConnected`` if the client disconnected while it waited.
+    /// open or close has been issued. If the `CONNECT` write fails, the
+    /// call that issued it and every call waiting on it throw that write's
+    /// error. If the write succeeds but the client was torn down while it
+    /// was in flight, they all throw ``CastError/notConnected`` instead.
     public func openVirtualConnection(to destination: String) async throws {
         try await openConnection(to: destination)
     }
@@ -472,6 +474,7 @@ public actor CastClient {
         }
         connectsInFlight[destination] = OpenInFlight(write: write, completion: completion)
         try await write.value
+        guard self.generation == generation else { throw CastError.notConnected }
         return intent
     }
 
