@@ -254,17 +254,17 @@ struct ClientTests {
         let mock = MockReceiver()
         mock.answersPings = false
         let client = makeClient(mock) {
-            $0.heartbeatInterval = .milliseconds(400)
-            $0.inactivityTimeout = .milliseconds(500)
+            $0.heartbeatInterval = .milliseconds(600)
+            $0.inactivityTimeout = .milliseconds(700)
         }
         try await client.connect()
         let start = ContinuousClock.now
         try await eventually { await client.state != .connected }
         let elapsed = ContinuousClock.now - start
         #expect(await client.state == .closed(.heartbeatTimeout))
-        // The first PING at 400 ms arms a deadline at 900 ms; the tick after
-        // that deadline would be at 1200 ms.
-        #expect(elapsed < .milliseconds(1100))
+        // The first PING at 600 ms arms a deadline at 1300 ms; the tick after
+        // that deadline would be at 1800 ms.
+        #expect(elapsed < .milliseconds(1700))
     }
 
     @Test func nonPositiveIntervalUsesTheDefaultCadence() async throws {
@@ -957,6 +957,61 @@ struct ClientTests {
         let result = try await client.receiver.availability(of: [.defaultMediaReceiver, .jellyfin])
         #expect(result[.defaultMediaReceiver] == .available)
         #expect(result[.jellyfin] == .unavailable)
+    }
+}
+
+@Suite("MockReceiver", .timeLimit(.minutes(1)))
+struct MockReceiverTests {
+    func ping() throws -> Data {
+        let message = CastMessage(sourceID: "sender-0", destinationID: "receiver-0", namespace: CastNamespace.heartbeat.rawValue, payload: .string(#"{"type":"PING"}"#))
+        return try FrameCodec.frame(message)
+    }
+
+    func heldPing(on mock: MockReceiver) async throws -> Task<Void, any Error> {
+        let frame = try ping()
+        let send = Task { try await mock.send(frame) }
+        try await eventually { mock.sentMessages(ofType: "PING").count == 1 }
+        return send
+    }
+
+    @Test func closeFailsHeldSendsByDefault() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let send = try await heldPing(on: mock)
+        mock.close()
+        await #expect(throws: MockReceiver.cancelledSendError) { try await send.value }
+    }
+
+    @Test func heldSendReleasedBeforeCloseSucceeds() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let send = try await heldPing(on: mock)
+        mock.releaseHeldSends()
+        try await send.value
+        mock.close()
+    }
+
+    @Test func heldSendReleasedAfterCloseFails() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let send = try await heldPing(on: mock)
+        mock.failsHeldSendsOnClose = false
+        mock.close()
+        mock.releaseHeldSends()
+        await #expect(throws: MockReceiver.cancelledSendError) { try await send.value }
+    }
+
+    @Test func answersPingsCanChangeAfterOpen() async throws {
+        let mock = MockReceiver()
+        try await mock.open()
+        mock.answersPings = false
+        try await mock.send(ping())
+        mock.answersPings = true
+        try await mock.send(ping())
+        mock.drop()
+        var replies = 0
+        for try await _ in mock.inbound { replies += 1 }
+        #expect(replies == 1)
     }
 }
 
