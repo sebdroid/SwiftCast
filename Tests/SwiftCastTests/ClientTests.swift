@@ -231,8 +231,7 @@ struct ClientTests {
         try await client.connect()
         try await eventually { await client.state != .connected }
         #expect(await client.state == .closed(.heartbeatTimeout))
-        let heldPings = first.sentMessages(ofType: "PING").count
-        #expect(heldPings >= 1)
+        try await eventually { first.heldSendCount >= 1 }
 
         try await client.connect()
         let states = await client.stateUpdates()
@@ -650,7 +649,7 @@ struct MockReceiverTests {
     func heldPing(on mock: MockReceiver) async throws -> Task<Void, any Error> {
         let frame = try ping()
         let send = Task { try await mock.send(frame) }
-        try await eventually { mock.sentMessages(ofType: "PING").count == 1 }
+        try await eventually { mock.heldSendCount == 1 }
         return send
     }
 

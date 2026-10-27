@@ -78,6 +78,13 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         state.withLock { _ = $0.heldTypes.insert(type) }
     }
 
+    /// The number of sends currently parked by ``holdSends(ofType:)``. A send
+    /// is recorded in ``sentMessages`` before it parks, so tests that need a
+    /// send to be held wait on this rather than on the message count.
+    var heldSendCount: Int {
+        state.withLock { $0.heldSends.count }
+    }
+
     /// Completes every held send, failing them with ``cancelledSendError``
     /// once the mock has been closed.
     func releaseHeldSends() {
