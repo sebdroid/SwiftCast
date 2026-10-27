@@ -103,11 +103,22 @@ public final class CastSession {
     @ObservationIgnored private(set) var attachedSessionID: String?
     @ObservationIgnored private var rejoinTask: Task<Void, Never>?
     @ObservationIgnored private var rejoinGeneration = 0
+    /// Kept until the loop itself ends, so a cancelled loop that has not
+    /// unwound yet still shows up in ``hasReconnectLoop``.
+    @ObservationIgnored private var reconnectTask: Task<Void, Never>?
+    @ObservationIgnored private var reconnectGeneration = 0
     @ObservationIgnored private var epoch = 0
     @ObservationIgnored private let makeClient: @Sendable (CastDevice) -> CastClient
 
     /// Whether a rejoin is polling for the remembered application, for tests.
     var isRejoining: Bool { rejoinTask != nil }
+
+    /// Whether a reconnect loop is still running, for tests.
+    var hasReconnectLoop: Bool { reconnectTask != nil }
+
+    /// Awaited by the receiver status watcher right after it reads the
+    /// client's latest status, so tests can land a loss in that suspension.
+    @ObservationIgnored var onReceiverStatusRead: (@MainActor (ReceiverStatus) async -> Void)?
 
     public init(appID: CastAppID = .defaultMediaReceiver) {
         self.appID = appID
@@ -275,21 +286,24 @@ public final class CastSession {
         receiverStatusTask?.cancel()
         stateTask = Task { [weak self] in
             for await state in await client.stateUpdates() {
-                guard let self, currentEpoch == self.epoch else { return }
+                guard let self, !Task.isCancelled, currentEpoch == self.epoch else { return }
                 if case .closed(let error?) = state {
-                    await self.connectionLost(device: device, error: error, epoch: currentEpoch)
+                    self.connectionLost(device: device, error: error, epoch: currentEpoch)
                     return
                 }
             }
         }
         receiverStatusTask = Task { [weak self] in
             for await update in await client.receiverStatusUpdates() {
-                guard let self, currentEpoch == self.epoch else { return }
+                guard let self, !Task.isCancelled, currentEpoch == self.epoch else { return }
                 // Stream elements can be delivered after newer statuses have
                 // arrived (for example the pre-launch status after a LAUNCH
                 // reply), so act on the client's latest status instead.
                 let status = await client.receiverStatus ?? update
-                guard currentEpoch == self.epoch else { return }
+                if let onReceiverStatusRead = self.onReceiverStatusRead { await onReceiverStatusRead(status) }
+                // A loss keeps the epoch, so only the cancellation it makes
+                // marks this status as stale.
+                guard !Task.isCancelled, currentEpoch == self.epoch else { return }
                 self.receiverStatus = status
                 if let app = status.application(self.appID) {
                     if self.mediaController == nil, self.allowsAutoAttach(to: app) {
@@ -352,38 +366,51 @@ public final class CastSession {
         return (try? await attachMedia(to: app, client: client, epoch: currentEpoch)) != nil
     }
 
-    private func connectionLost(device: CastDevice, error: CastError, epoch lostEpoch: Int) async {
+    private func connectionLost(device: CastDevice, error: CastError, epoch lostEpoch: Int) {
         // This runs on the state watcher, which returns as soon as this does,
         // so it is released rather than cancelled.
         stateTask = nil
         receiverStatusTask?.cancel()
         receiverStatusTask = nil
         rejoinTask?.cancel()
+        reconnectTask?.cancel()
         detachMedia()
         client = nil
         guard reconnectsAutomatically else {
             connectionState = .failed(device, error)
             return
         }
+        let lost = ContinuousClock.now
         let policy = reconnectPolicy
-        let clock = ContinuousClock()
-        let lost = clock.now
+        connectionState = .reconnecting(device, attempt: 1)
+        reconnectGeneration += 1
+        let generation = reconnectGeneration
+        reconnectTask = Task { [weak self] in
+            await self?.reconnect(device: device, error: error, epoch: lostEpoch, lost: lost, policy: policy)
+            if let self, self.reconnectGeneration == generation { self.reconnectTask = nil }
+        }
+    }
+
+    /// Ends without touching the session once it is cancelled, which
+    /// ``disconnect(stopApplication:)``, ``connect(to:)`` and a newer loss do.
+    private func reconnect(device: CastDevice, error: CastError, epoch lostEpoch: Int, lost: ContinuousClock.Instant, policy: ReconnectPolicy) async {
         let deadline = lost.advanced(by: policy.window)
         var nextAttempt = lost.advanced(by: policy.attemptInterval)
-        var attempt = 0
-        repeat {
-            attempt += 1
-            connectionState = .reconnecting(device, attempt: attempt)
-            try? await clock.sleep(until: nextAttempt)
-            guard lostEpoch == epoch else { return }
+        var attempt = 1
+        while true {
+            try? await Task.sleep(until: nextAttempt, clock: .continuous)
+            guard !Task.isCancelled, lostEpoch == epoch else { return }
             do {
                 try await establish(device, epoch: lostEpoch, rejoining: true)
                 return
             } catch {
-                guard lostEpoch == epoch else { return }
+                guard !Task.isCancelled, lostEpoch == epoch else { return }
             }
-            nextAttempt = clock.now.advanced(by: policy.attemptInterval)
-        } while nextAttempt <= deadline
+            nextAttempt = ContinuousClock.now.advanced(by: policy.attemptInterval)
+            guard nextAttempt <= deadline else { break }
+            attempt += 1
+            connectionState = .reconnecting(device, attempt: attempt)
+        }
         connectionState = .failed(device, error)
     }
 
@@ -459,6 +486,7 @@ public final class CastSession {
         receiverStatusTask = nil
         rejoinTask?.cancel()
         rejoinTask = nil
+        reconnectTask?.cancel()
         attachedSessionID = nil
         let controller = mediaController
         detachMedia()

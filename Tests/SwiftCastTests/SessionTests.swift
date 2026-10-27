@@ -438,6 +438,94 @@ struct SessionTests {
         #expect(log.client(at: mocks.count - 1) === session.client)
     }
 
+    @Test func disconnectEndsAReconnectLoopThatIsWaiting() async throws {
+        let first = MockReceiver()
+        Fixtures.installDefaultReceiver(on: first)
+        let attempts = AttemptLog()
+        let session = CastSession { _ in
+            _ = attempts.record()
+            return CastClient { first }
+        }
+        session.reconnectPolicy = CastSession.ReconnectPolicy(attemptInterval: .seconds(30), window: .seconds(60))
+        try await session.connect(to: device)
+
+        first.drop(with: CastError.connectionFailed("gone"))
+        try await eventually { await MainActor.run { session.connectionState == .reconnecting(device, attempt: 1) } }
+        #expect(session.hasReconnectLoop)
+
+        await session.disconnect()
+        #expect(session.connectionState == .disconnected)
+        try await eventually(timeout: .seconds(2)) { await MainActor.run { !session.hasReconnectLoop } }
+        #expect(session.connectionState == .disconnected)
+        #expect(attempts.count == 1)
+    }
+
+    @Test func connectEndsAReconnectLoopThatIsWaiting() async throws {
+        let first = MockReceiver()
+        Fixtures.installDefaultReceiver(on: first)
+        let second = MockReceiver()
+        Fixtures.installDefaultReceiver(on: second)
+        let attempts = AttemptLog()
+        let session = CastSession { _ in
+            attempts.record() == 1 ? CastClient { first } : CastClient { second }
+        }
+        session.reconnectPolicy = CastSession.ReconnectPolicy(attemptInterval: .seconds(30), window: .seconds(60))
+        try await session.connect(to: device)
+
+        first.drop(with: CastError.connectionFailed("gone"))
+        try await eventually { await MainActor.run { session.connectionState == .reconnecting(device, attempt: 1) } }
+        try await session.connect(to: device)
+        #expect(session.isConnected)
+        try await eventually(timeout: .seconds(2)) { await MainActor.run { !session.hasReconnectLoop } }
+        #expect(session.isConnected)
+        #expect(attempts.count == 2)
+    }
+
+    @Test func statusReadAsTheConnectionDropsIsNotApplied() async throws {
+        let first = MockReceiver()
+        Fixtures.installDefaultReceiver(on: first)
+        let session = CastSession { _ in CastClient { first } }
+        session.reconnectPolicy = CastSession.ReconnectPolicy(attemptInterval: .seconds(30), window: .seconds(60))
+        try await session.connect(to: device)
+        #expect(session.volume == 0.5)
+
+        let gate = Gate()
+        let resumed = MainActorFlag()
+        session.onReceiverStatusRead = { status in
+            guard status.volume?.level == 0.9 else { return }
+            await gate.wait()
+            // Set on the main actor, so the watcher has acted on the status
+            // by the time anything else on the main actor can see it.
+            resumed.value = true
+        }
+        first.push(Fixtures.receiverStatus(level: 0.9), namespace: .receiver, to: "*")
+        try await eventually { gate.isWaiting }
+        first.drop(with: CastError.connectionFailed("gone"))
+        try await eventually { await MainActor.run { session.connectionState == .reconnecting(device, attempt: 1) } }
+
+        gate.open()
+        try await eventually { await MainActor.run { resumed.value } }
+        #expect(session.volume == 0.5)
+        await session.disconnect()
+    }
+
+    @Test func lossReleasesTheReceiverWatcherEvenIfTheClientKeepsItsStreamsOpen() async throws {
+        let mocks = [MockReceiver(), MockReceiver()]
+        mocks.forEach { Fixtures.installDefaultReceiver(on: $0, appRunning: true) }
+        let log = ClientLog(mocks)
+        let session = CastSession { log.makeClient($0) }
+        session.reconnectPolicy = CastSession.ReconnectPolicy(attemptInterval: .milliseconds(20), window: .seconds(5))
+        try await session.connect(to: device)
+        let old = try #require(log.client(at: 0))
+        await old.keepObservationStreamsOpenOnClose()
+        try await eventually { await old.observationSubscriberCount == 2 }
+
+        mocks[0].drop(with: CastError.connectionFailed("reset"))
+        try await reconnected(session)
+        try await eventually { await old.observationSubscriberCount == 0 }
+        #expect(await old.state == .closed(.connectionFailed("reset")))
+    }
+
     @Test func failedStatusDuringConnectLeavesNoClientBehind() async throws {
         let mock = MockReceiver()
         mock.on("GET_STATUS") { request, mock in
@@ -582,4 +670,45 @@ final class ClientLog: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return entries.count
     }
+}
+
+/// Holds whoever calls ``wait()`` until ``open()``, ignoring cancellation.
+final class Gate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var opened = false
+    private var waiting = false
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if opened {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            self.continuation = continuation
+            waiting = true
+            lock.unlock()
+        }
+    }
+
+    func open() {
+        lock.lock()
+        opened = true
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume()
+    }
+
+    var isWaiting: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return waiting
+    }
+}
+
+@MainActor
+final class MainActorFlag {
+    var value = false
 }
