@@ -40,8 +40,8 @@ try await media.pause()
   live streams, `customData`, and status streaming with position interpolation.
 - **Custom receivers**: send and receive messages on any namespace. This covers Jellyfin, your own
   receiver apps, and anything else.
-- **`CastSession`**: an `@Observable` layer for SwiftUI that joins running sessions and reconnects
-  automatically with backoff.
+- **`CastSession`**: an `@Observable` layer for SwiftUI that joins running sessions and, after a
+  dropped connection, retries at a fixed interval for a bounded window.
 - **SwiftUI views**: `CastButton` and `CastDevicePicker`.
 - **`castctl`**: a command-line controller for scripting and debugging.
 - Swift 6 language mode with strict concurrency throughout. Unknown protocol values decode as
