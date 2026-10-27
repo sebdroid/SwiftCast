@@ -330,6 +330,7 @@ public actor CastClient {
             return try await inFlight.value
         }
         guard !connectedDestinations.contains(destination) else { return }
+        let generation = generation
         // Registered before the write so a message the peer sends as soon as
         // it sees CONNECT is not dropped as coming from an unknown peer.
         connectedDestinations.insert(destination)
@@ -337,19 +338,28 @@ public actor CastClient {
         let write = Task { try await sendJSON(payload, namespace: .connection, to: destination) }
         connectsInFlight[destination] = write
         defer {
-            if connectsInFlight[destination] == write { connectsInFlight[destination] = nil }
+            if self.generation == generation, connectsInFlight[destination] == write { connectsInFlight[destination] = nil }
         }
         do {
             try await write.value
         } catch {
-            connectedDestinations.remove(destination)
-            protocolVersions[destination] = nil
+            // After a reconnect the entry belongs to the new connection.
+            if self.generation == generation {
+                connectedDestinations.remove(destination)
+                protocolVersions[destination] = nil
+            }
             throw error
         }
     }
 
-    /// Closes the virtual connection to `destination`.
+    /// Closes the virtual connection to `destination`. If the connection is
+    /// still opening, this waits for the open to finish first.
     public func closeVirtualConnection(to destination: String) async {
+        if let inFlight = connectsInFlight[destination] {
+            let generation = generation
+            _ = try? await inFlight.value
+            guard self.generation == generation else { return }
+        }
         guard connectedDestinations.remove(destination) != nil else { return }
         protocolVersions[destination] = nil
         try? await sendJSON(Self.closePayload, namespace: .connection, to: destination)
@@ -568,9 +578,13 @@ public actor CastClient {
     }
 
     /// Whether an inbound message may be routed at all. Messages for other
-    /// senders, from peers without a virtual connection, or with a payload a
-    /// Google namespace cannot carry are dropped, as chromium's and open
-    /// screen's cast channel code do.
+    /// senders, or with a payload a Google namespace cannot carry, are dropped
+    /// as chromium's and open screen's cast channel code do. Messages from
+    /// peers without a virtual connection are dropped too, `*` broadcasts
+    /// included. That is stricter than open screen's
+    /// virtual_connection_router.cc, which still delivers broadcasts to every
+    /// endpoint, but no controller here needs a broadcast from a peer it has
+    /// not connected to.
     private func accepts(_ message: InboundMessage) -> Bool {
         let namespace = message.namespace
         guard message.destinationID == senderID || message.destinationID == CastEndpoint.broadcast else {
