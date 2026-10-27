@@ -23,6 +23,17 @@ public actor CastClient {
         case closed(CastError?)
     }
 
+    /// The version of SwiftCast, reported to receivers in the `CONNECT` message.
+    public static let version = "1.0.1"
+
+    /// How an application virtual connection is presented to the receiver.
+    public enum ConnectionType: Int, Sendable {
+        /// A regular sender connection, visible to the application as a connected sender.
+        case strong = 0
+        /// A connection the application is not told about as a connected sender.
+        case invisible = 2
+    }
+
     /// Tunable client behavior.
     public struct Configuration: Sendable {
         /// Interval between heartbeat `PING`s.
@@ -31,13 +42,21 @@ public actor CastClient {
         public var heartbeatTimeout: Duration = .seconds(16)
         /// Default time to wait for a response to a request.
         public var requestTimeout: Duration = .seconds(15)
-        /// Sent in the `CONNECT` message.
-        public var userAgent: String = "SwiftCast/1.0"
+        /// Sent in the `CONNECT` message. Defaults to
+        /// `SwiftCast/<version> (<os name> <os version>)`.
+        public var userAgent: String = CastClient.defaultUserAgent
+        /// The connection type requested when opening a virtual connection to an
+        /// application. The platform receiver connection is always ``ConnectionType/strong``.
+        public var applicationConnectionType: ConnectionType = .strong
 
         public init() {}
     }
 
     /// The source ID used for messages sent by this client.
+    ///
+    /// Defaults to `sender-` followed by a lowercase UUID, unique to each
+    /// client. `sender-0` and `*` are reserved by the protocol and should not
+    /// be used.
     public nonisolated let senderID: String
     public nonisolated let configuration: Configuration
 
@@ -57,6 +76,7 @@ public actor CastClient {
     private var pending: [Int: PendingRequest] = [:]
     private var nextRequestID = 1
     private var connectedDestinations: Set<String> = []
+    private var protocolVersions: [String: Int] = [:]
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var lastInbound = ContinuousClock.now
@@ -70,7 +90,7 @@ public actor CastClient {
     /// Creates a client whose transport is produced by `makeTransport` on each
     /// call to ``connect()``, allowing the client to reconnect.
     public init(
-        senderID: String = "sender-0",
+        senderID: String = CastClient.makeSenderID(),
         configuration: Configuration = Configuration(),
         makeTransport: @escaping @Sendable () -> any CastTransport
     ) {
@@ -80,7 +100,7 @@ public actor CastClient {
     }
 
     /// Creates a client for a discovered device.
-    public init(device: CastDevice, senderID: String = "sender-0", configuration: Configuration = Configuration()) {
+    public init(device: CastDevice, senderID: String = CastClient.makeSenderID(), configuration: Configuration = Configuration()) {
         let endpoint = device.endpoint
         self.init(senderID: senderID, configuration: configuration) {
             NetworkTransport(endpoint: endpoint)
@@ -88,7 +108,7 @@ public actor CastClient {
     }
 
     /// Creates a client for a device at a known host and port.
-    public init(host: String, port: UInt16 = 8009, senderID: String = "sender-0", configuration: Configuration = Configuration()) {
+    public init(host: String, port: UInt16 = 8009, senderID: String = CastClient.makeSenderID(), configuration: Configuration = Configuration()) {
         self.init(senderID: senderID, configuration: configuration) {
             NetworkTransport(host: host, port: port)
         }
@@ -110,6 +130,7 @@ public actor CastClient {
         setState(.connecting)
         decoder = FrameDecoder()
         connectedDestinations = []
+        protocolVersions = [:]
 
         let transport = makeTransport()
         self.transport = transport
@@ -164,13 +185,9 @@ public actor CastClient {
     public func disconnect() async {
         guard let transport, state == .connected || state == .connecting else { return }
         for destination in connectedDestinations where destination == CastEndpoint.platformReceiver {
-            let close = CastMessage(
-                sourceID: senderID,
-                destinationID: destination,
-                namespace: CastNamespace.connection.rawValue,
-                payload: .string(#"{"type":"CLOSE"}"#)
-            )
-            try? await transport.send(FrameCodec.frame(close))
+            if let close = try? Self.makeMessage(Self.closePayload, source: senderID, namespace: .connection, destination: destination) {
+                try? await transport.send(FrameCodec.frame(close))
+            }
         }
         teardown(error: nil, generation: generation)
     }
@@ -272,26 +289,22 @@ public actor CastClient {
     /// Does nothing if one is already open.
     public func openVirtualConnection(to destination: String) async throws {
         guard !connectedDestinations.contains(destination) else { return }
-        let payload: JSONValue = [
-            "type": "CONNECT",
-            "origin": [:],
-            "userAgent": .string(configuration.userAgent),
-            "senderInfo": [
-                "sdkType": 2,
-                "version": "15.605.1.3",
-                "browserVersion": "44.0.2403.30",
-                "platform": 4,
-                "connectionType": 1,
-            ],
-        ]
-        try await sendJSON(payload, namespace: .connection, to: destination)
+        // Inserted before sending so a CONNECTED reply handled while the send is suspended is recorded.
         connectedDestinations.insert(destination)
+        do {
+            try await sendJSON(connectPayload(to: destination), namespace: .connection, to: destination)
+        } catch {
+            connectedDestinations.remove(destination)
+            protocolVersions[destination] = nil
+            throw error
+        }
     }
 
     /// Closes the virtual connection to `destination`.
     public func closeVirtualConnection(to destination: String) async {
         guard connectedDestinations.remove(destination) != nil else { return }
-        try? await sendJSON(["type": "CLOSE"], namespace: .connection, to: destination)
+        protocolVersions[destination] = nil
+        try? await sendJSON(Self.closePayload, namespace: .connection, to: destination)
     }
 
     /// Whether a virtual connection to `destination` is currently open.
@@ -333,6 +346,82 @@ public actor CastClient {
     }
 
     // MARK: - Internal
+
+    /// `reasonCode` 5 tells the receiver the sender closed the connection on purpose.
+    static let closePayload: JSONValue = ["type": "CLOSE", "reasonCode": 5]
+
+    /// The protocol version the receiver reported in `CONNECTED` for `destination`.
+    func negotiatedProtocolVersion(for destination: String) -> Int? {
+        protocolVersions[destination]
+    }
+
+    /// Only protocol version 0 is advertised because message chunking is not implemented.
+    func connectPayload(to destination: String) -> JSONValue {
+        let connectionType = destination == CastEndpoint.platformReceiver ? .strong : configuration.applicationConnectionType
+        return [
+            "type": "CONNECT",
+            "userAgent": .string(configuration.userAgent),
+            "origin": [:],
+            "connType": .number(Double(connectionType.rawValue)),
+            "protocolVersion": 0,
+            "protocolVersionList": [0],
+            "senderInfo": [
+                "sdkType": 2,
+                "version": .string(Self.version),
+                "browserVersion": .string(Self.version),
+                "platform": .number(Double(Self.senderPlatform)),
+                "systemVersion": .string(Self.systemVersion),
+                "connectionType": 1,
+            ],
+        ]
+    }
+
+    @usableFromInline
+    static func makeSenderID() -> String {
+        "sender-" + UUID().uuidString.lowercased()
+    }
+
+    static var defaultUserAgent: String {
+        "SwiftCast/\(version) (\(osName) \(systemVersion))"
+    }
+
+    static var systemVersion: String {
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        return "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
+    }
+
+    private static var osName: String {
+        #if os(macOS)
+        "macOS"
+        #elseif os(visionOS)
+        "visionOS"
+        #elseif os(tvOS)
+        "tvOS"
+        #elseif os(watchOS)
+        "watchOS"
+        #elseif os(iOS)
+        "iOS"
+        #elseif os(Linux)
+        "Linux"
+        #else
+        "unknown"
+        #endif
+    }
+
+    /// The `senderInfo.platform` value. Open screen's message_util.cc uses 2 for iOS,
+    /// 4 for macOS and 6 for linux; chromium sends 4 for every apple build and also
+    /// uses 6 for linux.
+    static var senderPlatform: Int {
+        #if os(iOS) || os(tvOS) || os(visionOS)
+        2
+        #elseif os(macOS)
+        4
+        #elseif os(Linux)
+        6
+        #else
+        0
+        #endif
+    }
 
     func sendJSON(_ json: JSONValue, namespace: CastNamespace, to destination: String) async throws {
         try await sendRaw(Self.makeMessage(json, source: senderID, namespace: namespace, destination: destination))
@@ -393,13 +482,21 @@ public actor CastClient {
             }
             return
         case .connection:
-            if message.type == "CLOSE" {
+            switch message.type {
+            case "CONNECTED":
+                if connectedDestinations.contains(message.sourceID), let version = message.json?["protocolVersion"]?.intValue {
+                    protocolVersions[message.sourceID] = version
+                }
+            case "CLOSE":
                 connectedDestinations.remove(message.sourceID)
+                protocolVersions[message.sourceID] = nil
                 if message.sourceID == CastEndpoint.platformReceiver {
                     messageBroadcaster.yield(message)
-                    teardown(error: .connectionFailed("Connection closed by device"), generation: generation)
+                    teardown(error: .closedByReceiver, generation: generation)
                     return
                 }
+            default:
+                break
             }
         case .receiver:
             if message.type == "RECEIVER_STATUS", let status = try? message.json?["status"]?.decode(ReceiverStatus.self) {
@@ -449,6 +546,7 @@ public actor CastClient {
         transport?.close()
         transport = nil
         connectedDestinations = []
+        protocolVersions = [:]
         let failures = pending
         pending = [:]
         for request in failures.values {
