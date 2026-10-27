@@ -101,6 +101,17 @@ public actor CastClient {
         let requestID: Int
     }
 
+    /// The client's one pending launch. Each caller waiting on it is keyed
+    /// by a token and keeps its own `LaunchWaiter`. A launch with no waiters left
+    /// has been cancelled and stays recorded until its `LAUNCH` leaves
+    /// `pending`, so a new launch cannot collide with it.
+    private struct LaunchInFlight {
+        let id: Int
+        let appID: CastAppID
+        let task: Task<CastApplication, any Error>
+        var waiters: [Int: LaunchWaiter]
+    }
+
     private struct OpenInFlight {
         let write: Task<Void, any Error>
         let completion: OpenCompletion
@@ -109,6 +120,28 @@ public actor CastClient {
     private struct PendingRequest {
         let continuation: CheckedContinuation<InboundMessage, any Error>
         let timeoutTask: Task<Void, Never>
+        let type: String?
+        let options: RequestOptions
+    }
+
+    /// How a request is correlated with its replies and when it completes.
+    struct RequestOptions: Sendable {
+        /// Only one request of this payload's `type` may be pending per
+        /// namespace and destination at a time.
+        var exclusive = false
+        /// Replies may echo the id as `launchRequestId` instead of `requestId`.
+        var acceptsLaunchRequestID = false
+        /// Whether a correlated reply completes the request.
+        var isFinal: @Sendable (InboundMessage) -> Bool = { _ in true }
+        /// Runs on the client for each correlated reply that does not complete the request.
+        var onUpdate: (@Sendable (isolated CastClient, InboundMessage) -> Void)?
+        /// Runs on the client as the request leaves `pending`, whatever the
+        /// outcome, before its caller resumes.
+        var onSettled: (@Sendable (isolated CastClient) -> Void)?
+        /// Runs on the client once the request is registered and its write
+        /// scheduled, before that write runs. Tests use it to land a
+        /// cancellation in that gap.
+        var onRegistered: (@Sendable (isolated CastClient) -> Void)?
     }
 
     private let makeTransport: @Sendable () -> any CastTransport
@@ -121,7 +154,12 @@ public actor CastClient {
     private var connectsInFlight: [String: OpenInFlight] = [:]
     private var virtualConnectionIntents: [String: Int] = [:]
     private(set) var closesAwaitingOpen = 0
+    private var launchInFlight: LaunchInFlight?
+    private var nextLaunchID = 0
+    private var nextLaunchWaiter = 0
     private var protocolVersions: [String: Int] = [:]
+    /// The timeout the latest request of each payload `type` was given, for tests.
+    private(set) var lastTimeoutByRequestType: [String: Duration] = [:]
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var nextPing = ContinuousClock.now
@@ -177,6 +215,7 @@ public actor CastClient {
         decoder = FrameDecoder()
         connectedDestinations = []
         connectsInFlight = [:]
+        launchInFlight = nil
         protocolVersions = [:]
 
         let transport = makeTransport()
@@ -292,47 +331,84 @@ public actor CastClient {
 
     /// Sends a JSON request and waits for the response carrying the same `requestId`.
     ///
+    /// Only a reply on `namespace` from `destination` answers the request.
+    /// `until` decides whether such a reply completes it: a reply it rejects
+    /// is an intermediate update, still delivered through ``messages(in:)``,
+    /// and the request stays pending until a later reply is accepted or
+    /// `timeout` passes. The timeout covers the whole exchange, not each reply.
+    ///
     /// Standard Cast error responses (`LAUNCH_ERROR`, `LOAD_FAILED`,
     /// `INVALID_REQUEST`, …) are thrown as ``CastError``.
+    ///
+    /// A request cancelled before its message is written is not written at all.
     public func request(
         _ payload: some Encodable & Sendable,
         namespace: CastNamespace,
         to destination: String,
-        timeout: Duration? = nil
+        timeout: Duration? = nil,
+        until isFinal: @escaping @Sendable (InboundMessage) -> Bool = { _ in true }
+    ) async throws -> InboundMessage {
+        try await request(payload, namespace: namespace, to: destination, timeout: timeout, options: RequestOptions(isFinal: isFinal))
+    }
+
+    func request(
+        _ payload: some Encodable & Sendable,
+        namespace: CastNamespace,
+        to destination: String,
+        timeout: Duration?,
+        options: RequestOptions
     ) async throws -> InboundMessage {
         guard state == .connected || state == .connecting else { throw CastError.notConnected }
         guard case .object(var object) = try JSONValue(encoding: payload) else {
             throw CastError.invalidPayload("Request payload must be a JSON object")
         }
+        let type = object["type"]?.stringValue
         let requestID = nextRequestID
         nextRequestID = nextRequestID == Int32.max ? 1 : nextRequestID + 1
         let key = PendingKey(namespace: namespace, destination: destination, requestID: requestID)
         object["requestId"] = .number(Double(requestID))
         let message = try Self.makeMessage(JSONValue.object(object), source: senderID, namespace: namespace, destination: destination)
         let timeout = timeout ?? configuration.requestTimeout
+        if let type { lastTimeoutByRequestType[type] = timeout }
+        let cancelled = OSAllocatedUnfairLock(initialState: false)
 
         let response = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<InboundMessage, any Error>) in
+                // Checked here, where registration happens, so two callers cannot both pass.
+                if options.exclusive, let type, isPending(type, namespace: namespace, destination: destination) {
+                    continuation.resume(throwing: CastError.requestInFlight(type))
+                    return
+                }
                 let timeoutTask = Task { [weak self] in
                     try? await Task.sleep(for: timeout)
                     guard !Task.isCancelled else { return }
                     await self?.resolve(key, with: .failure(CastError.timeout))
                 }
-                pending[key] = PendingRequest(continuation: continuation, timeoutTask: timeoutTask)
+                pending[key] = PendingRequest(continuation: continuation, timeoutTask: timeoutTask, type: type, options: options)
                 if Task.isCancelled {
                     // The cancellation handler may have run before registration.
                     resolve(key, with: .failure(CancellationError()))
                     return
                 }
                 Task {
+                    // The caller may have been cancelled, or the request
+                    // settled, after registration; it is then never written.
+                    // The flag covers a cancellation whose resolve has not
+                    // reached the client yet.
+                    guard self.pending[key] != nil else { return }
+                    guard !cancelled.withLock({ $0 }) else {
+                        return self.resolve(key, with: .failure(CancellationError()))
+                    }
                     do {
                         try await self.sendRaw(message)
                     } catch {
                         self.resolve(key, with: .failure(error))
                     }
                 }
+                options.onRegistered?(self)
             }
         } onCancel: {
+            cancelled.withLock { $0 = true }
             Task { await self.resolve(key, with: .failure(CancellationError())) }
         }
 
@@ -351,6 +427,14 @@ public actor CastClient {
     /// error. If the write succeeds but the client was torn down while it
     /// was in flight, they all throw ``CastError/notConnected`` instead.
     public func openVirtualConnection(to destination: String) async throws {
+        try await openConnection(to: destination)
+    }
+
+    /// Returns the intent this call recorded when it wrote the `CONNECT`
+    /// itself, or `nil` when it found the connection open or shared the
+    /// write of another call.
+    @discardableResult
+    private func openConnection(to destination: String) async throws -> Int? {
         let intent = recordIntent(for: destination)
         let generation = generation
         // Every join re-checks before looping, so the write below only ever
@@ -359,9 +443,9 @@ public actor CastClient {
         while let inFlight = connectsInFlight[destination] {
             try await inFlight.write.value
             guard self.generation == generation else { throw CastError.notConnected }
-            guard virtualConnectionIntents[destination] == intent, !connectedDestinations.contains(destination) else { return }
+            guard virtualConnectionIntents[destination] == intent, !connectedDestinations.contains(destination) else { return nil }
         }
-        guard !connectedDestinations.contains(destination) else { return }
+        guard !connectedDestinations.contains(destination) else { return nil }
         // Registered before the write so a message the peer sends as soon as
         // it sees CONNECT is not dropped as coming from an unknown peer.
         connectedDestinations.insert(destination)
@@ -391,6 +475,7 @@ public actor CastClient {
         connectsInFlight[destination] = OpenInFlight(write: write, completion: completion)
         try await write.value
         guard self.generation == generation else { throw CastError.notConnected }
+        return intent
     }
 
     /// Closes the virtual connection to `destination`.
@@ -454,16 +539,44 @@ public actor CastClient {
 
     /// Returns a media controller for a running application, opening a
     /// virtual connection to it and fetching its current media status.
+    ///
+    /// A failed status fetch still returns the controller, but a cancelled
+    /// call throws `CancellationError`. A cancelled call that wrote the
+    /// application's `CONNECT` itself closes that virtual connection again
+    /// before it throws, unless another open or close of it has been issued
+    /// since, as by a concurrent call for the same application. A cancelled
+    /// call that found the connection already open, or shared another
+    /// call's `CONNECT`, leaves it as it is. As with
+    /// ``MediaController/detach()``, that `CLOSE` can end an application
+    /// whose last connected sender this client was.
     public func mediaController(for application: CastApplication) async throws -> MediaController {
-        try await openVirtualConnection(to: application.transportId)
+        let destination = application.transportId
+        let generation = generation
+        let openedIntent = try await openConnection(to: destination)
         let controller = MediaController(client: self, application: application)
         await controller.start()
         _ = try? await controller.refreshStatus()
+        if Task.isCancelled {
+            // Checked and closed without suspending in between, so an open
+            // issued meanwhile always keeps the connection.
+            if let openedIntent, self.generation == generation, virtualConnectionIntents[destination] == openedIntent {
+                await closeVirtualConnection(to: destination)
+            }
+            throw CancellationError()
+        }
         return controller
     }
 
     /// Joins `appID` if it is already running, otherwise launches it, and
     /// returns a media controller for it.
+    ///
+    /// A launch shared with other callers (see ``ReceiverController/launch(_:timeout:onStatus:)``)
+    /// is cancelled only when every caller waiting on it has been cancelled.
+    /// A cancelled call throws `CancellationError` straight away, at any
+    /// stage, and stops receiving that launch's `LAUNCH_STATUS` updates.
+    /// Cancelled while it attaches, it first closes the application's
+    /// virtual connection as ``mediaController(for:)`` does, waiting only for
+    /// that write. It never stops an application it launched.
     public func launchMediaApp(_ appID: CastAppID = .defaultMediaReceiver) async throws -> MediaController {
         let status = try await receiver.getStatus()
         let application: CastApplication
@@ -473,6 +586,102 @@ public actor CastClient {
             application = try await receiver.launch(appID)
         }
         return try await mediaController(for: application)
+    }
+
+    /// Runs `start` as the client's one pending launch, or joins the pending
+    /// launch of the same app. `start` must send its request with the
+    /// options it is given, which tie the launch to that request.
+    ///
+    /// A cancelled caller, whether it started the launch or joined it,
+    /// throws `CancellationError` straight away and stops waiting; the
+    /// launch itself is cancelled only when every caller waiting on it has
+    /// been cancelled. `onStatus` receives each `LAUNCH_STATUS` update that
+    /// arrives while its caller is still waiting: none handled after its
+    /// cancellation has been requested.
+    func coalescedLaunch(
+        _ appID: CastAppID,
+        onStatus: (@Sendable (String) -> Void)?,
+        _ start: @escaping @Sendable (RequestOptions) async throws -> CastApplication
+    ) async throws -> CastApplication {
+        try Task.checkCancellation()
+        while let abandoned = launchInFlight, abandoned.waiters.isEmpty {
+            _ = try? await awaitingCancellation(of: abandoned.task)
+            try Task.checkCancellation()
+        }
+        nextLaunchWaiter += 1
+        let waiter = nextLaunchWaiter
+        let launchWaiter = LaunchWaiter(onStatus: onStatus)
+        let id: Int
+        let task: Task<CastApplication, any Error>
+        if let launchInFlight {
+            guard launchInFlight.appID == appID else { throw CastError.requestInFlight("LAUNCH") }
+            id = launchInFlight.id
+            task = launchInFlight.task
+            self.launchInFlight?.waiters[waiter] = launchWaiter
+        } else {
+            nextLaunchID += 1
+            id = nextLaunchID
+            let options = launchRequestOptions(id)
+            task = Task { [weak self] in
+                do {
+                    let application = try await start(options)
+                    await self?.endLaunch(id)
+                    return application
+                } catch {
+                    await self?.endLaunch(id)
+                    throw error
+                }
+            }
+            launchInFlight = LaunchInFlight(id: id, appID: appID, task: task, waiters: [waiter: launchWaiter])
+        }
+        defer { leaveLaunch(id, waiter: waiter) }
+        return try await withTaskCancellationHandler {
+            try await awaitingCancellation(of: task)
+        } onCancel: {
+            // `leaveLaunch` only runs once this caller is back on the client,
+            // so statuses handled before then must already pass it by.
+            launchWaiter.depart()
+        }
+    }
+
+    /// The task of the pending launch, for tests.
+    var pendingLaunch: Task<CastApplication, any Error>? { launchInFlight?.task }
+
+    /// How many callers are waiting on the pending launch, for tests.
+    var pendingLaunchWaiters: Int { launchInFlight?.waiters.count ?? 0 }
+
+    /// The launch ends as its reply settles the `LAUNCH`, on the same actor
+    /// turn, so a call queued behind that reply starts a new launch instead
+    /// of joining one whose result is already decided.
+    private func launchRequestOptions(_ id: Int) -> RequestOptions {
+        RequestOptions(
+            exclusive: true,
+            acceptsLaunchRequestID: true,
+            isFinal: { $0.type != "LAUNCH_STATUS" },
+            onUpdate: { client, message in
+                guard let status = message.json?["status"]?.stringValue else { return }
+                client.deliverLaunchStatus(status, launch: id)
+            },
+            onSettled: { client in client.endLaunch(id) }
+        )
+    }
+
+    private func deliverLaunchStatus(_ status: String, launch id: Int) {
+        guard let launch = launchInFlight, launch.id == id else { return }
+        for waiter in launch.waiters.values where !waiter.hasDeparted { waiter.onStatus?(status) }
+    }
+
+    /// Also run from the launch task, for a `start` that fails before its request settles.
+    private func endLaunch(_ id: Int) {
+        if launchInFlight?.id == id { launchInFlight = nil }
+    }
+
+    /// A launch still pending when its last waiter leaves has only cancelled
+    /// waiters, since a launch ends before its result is delivered.
+    private func leaveLaunch(_ id: Int, waiter: Int) {
+        guard launchInFlight?.id == id else { return }
+        launchInFlight?.waiters[waiter] = nil
+        if launchInFlight?.waiters.isEmpty == true { launchInFlight?.task.cancel() }
     }
 
     /// Convenience for ``launchMediaApp(_:)`` with the Default Media Receiver.
@@ -595,9 +804,38 @@ public actor CastClient {
         stateBroadcaster.yield(newState)
     }
 
+    private func isPending(_ type: String, namespace: CastNamespace, destination: String) -> Bool {
+        pending.contains { $0.key.namespace == namespace && $0.key.destination == destination && $0.value.type == type }
+    }
+
+    /// Completes the pending request a reply answers, unless its completion
+    /// rule treats the reply as an intermediate update.
+    private func correlate(_ message: InboundMessage) {
+        for case let (id?, isLaunchEcho) in [(message.requestID, false), (message.launchRequestID, true)] where id != 0 {
+            let key = PendingKey(namespace: message.namespace, destination: message.sourceID, requestID: id)
+            guard let request = pending[key], !isLaunchEcho || request.options.acceptsLaunchRequestID else { continue }
+            if request.options.isFinal(message) {
+                resolve(key, with: .success(message))
+            } else {
+                request.options.onUpdate?(self, message)
+            }
+            return
+        }
+    }
+
+    /// Times out every pending request of `type` at once, as if its timer
+    /// fired. Tests use it from `onRegistered` to settle a request before its
+    /// write runs, which a real timer cannot be ordered to do.
+    func expirePendingRequests(ofType type: String) {
+        for (key, request) in pending where request.type == type {
+            resolve(key, with: .failure(CastError.timeout))
+        }
+    }
+
     private func resolve(_ key: PendingKey, with result: Result<InboundMessage, any Error>) {
         guard let request = pending.removeValue(forKey: key) else { return }
         request.timeoutTask.cancel()
+        request.options.onSettled?(self)
         request.continuation.resume(with: result)
     }
 
@@ -648,9 +886,7 @@ public actor CastClient {
             break
         }
 
-        if let requestID = message.requestID, requestID != 0 {
-            resolve(PendingKey(namespace: message.namespace, destination: message.sourceID, requestID: requestID), with: .success(message))
-        }
+        correlate(message)
         messageBroadcaster.yield(message)
     }
 
@@ -743,6 +979,7 @@ public actor CastClient {
         transport = nil
         connectedDestinations = []
         connectsInFlight = [:]
+        launchInFlight = nil
         protocolVersions = [:]
         let failures = pending
         pending = [:]
@@ -768,6 +1005,59 @@ public actor CastClient {
         default: return nil
         }
     }
+}
+
+private enum JoinState<Success: Sendable>: Sendable {
+    case waiting
+    case suspended(CheckedContinuation<Success, any Error>)
+    case finished
+}
+
+/// Waits for `task` without owning it, since `Task.value` ignores the
+/// waiter's cancellation: a cancelled waiter throws `CancellationError`
+/// promptly and `task` keeps running for its other callers.
+@discardableResult
+private func awaitingCancellation<Success: Sendable>(of task: Task<Success, any Error>) async throws -> Success {
+    let state = OSAllocatedUnfairLock<JoinState<Success>>(initialState: .waiting)
+    return try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Success, any Error>) in
+            let cancelled = state.withLock { state -> Bool in
+                guard case .waiting = state else { return true }
+                state = .suspended(continuation)
+                return false
+            }
+            guard !cancelled else { return continuation.resume(throwing: CancellationError()) }
+            Task {
+                let result = await task.result
+                state.withLock { state -> CheckedContinuation<Success, any Error>? in
+                    guard case .suspended(let continuation) = state else { return nil }
+                    state = .finished
+                    return continuation
+                }?.resume(with: result)
+            }
+        }
+    } onCancel: {
+        state.withLock { state -> CheckedContinuation<Success, any Error>? in
+            defer { state = .finished }
+            guard case .suspended(let continuation) = state else { return nil }
+            return continuation
+        }?.resume(throwing: CancellationError())
+    }
+}
+
+/// A caller waiting on a launch. It is marked departed by its cancellation
+/// handler, synchronously, so status fan-out skips it at once.
+private final class LaunchWaiter: Sendable {
+    let onStatus: (@Sendable (String) -> Void)?
+    private let departed = OSAllocatedUnfairLock(initialState: false)
+
+    init(onStatus: (@Sendable (String) -> Void)?) {
+        self.onStatus = onStatus
+    }
+
+    var hasDeparted: Bool { departed.withLock { $0 } }
+
+    func depart() { departed.withLock { $0 = true } }
 }
 
 /// Lets closes wait for an in-flight open without owning its write.
