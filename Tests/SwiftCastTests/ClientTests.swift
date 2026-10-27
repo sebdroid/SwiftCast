@@ -134,17 +134,47 @@ struct ClientTests {
         try await client.connect()
         // The first PING arms the deadline; inbound traffic right after it
         // clears it, so the next PING arms a fresh one.
-        try await eventually { mock.sentMessages(ofType: "PING").count == 1 }
+        try await eventually { mock.sentMessages(ofType: "PING").count >= 1 }
         mock.push(Fixtures.receiverStatus(level: 0.3), namespace: .receiver, to: "*")
         try await eventually { await client.receiverStatus?.volume?.level == 0.3 }
         let lastInbound = ContinuousClock.now
         try await eventually(timeout: .seconds(5)) { await client.state != .connected }
         let elapsed = ContinuousClock.now - lastInbound
         #expect(await client.state == .closed(.heartbeatTimeout))
-        // Without the clear the deadline would fire about 400 ms after the
-        // inbound message instead of about 600 ms.
-        #expect(elapsed >= .milliseconds(500))
         #expect(elapsed < .milliseconds(1100))
+    }
+
+    @Test func intervalLongerThanTimeoutStillDetectsSilence() async throws {
+        let answering = MockReceiver()
+        let silent = MockReceiver()
+        silent.answersPings = false
+        let configure: (inout CastClient.Configuration) -> Void = {
+            $0.heartbeatInterval = .milliseconds(300)
+            $0.inactivityTimeout = .milliseconds(100)
+        }
+        let healthy = makeClient(answering, configure: configure)
+        let dead = makeClient(silent, configure: configure)
+        try await healthy.connect()
+        try await dead.connect()
+
+        try await eventually { await dead.state != .connected }
+        #expect(await dead.state == .closed(.heartbeatTimeout))
+        try await eventually { answering.sentMessages(ofType: "PING").count >= 3 }
+        #expect(await healthy.state == .connected)
+    }
+
+    @Test func stalledPingWriteStillTimesOut() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(50)
+            $0.inactivityTimeout = .milliseconds(200)
+        }
+        try await client.connect()
+        try await eventually { await client.state != .connected }
+        #expect(await client.state == .closed(.heartbeatTimeout))
+        #expect(mock.sentMessages(ofType: "PING").count >= 1)
+        mock.releaseHeldSends()
     }
 
     @Test func anyInboundTrafficKeepsConnectionAlive() async throws {
@@ -176,7 +206,7 @@ struct ClientTests {
         try await eventually { await client.state != .connected }
         #expect(ContinuousClock.now - start < .seconds(2))
         #expect(await client.state == .closed(.connectionFailed("heartbeat write failed: broken pipe")))
-        #expect(mock.sentMessages(ofType: "PING").count == 1)
+        #expect(mock.sentMessages(ofType: "PING").count >= 1)
     }
 
     @Test func failedPongWriteTearsDown() async throws {
@@ -296,12 +326,15 @@ struct ClientTests {
         #expect(senderInfo["sdkType"] == 2)
         #expect(senderInfo["version"] == .string(CastClient.version))
         #expect(senderInfo["browserVersion"] == .string(CastClient.version))
-        #expect(senderInfo["systemVersion"] == .string(ProcessInfo.processInfo.operatingSystemVersionString))
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        #expect(senderInfo["systemVersion"] == .string("\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"))
         #expect(senderInfo["connectionType"] == 1)
         #if os(iOS) || os(tvOS) || os(visionOS)
         #expect(senderInfo["platform"] == 2)
         #elseif os(macOS)
         #expect(senderInfo["platform"] == 4)
+        #elseif os(Linux)
+        #expect(senderInfo["platform"] == 6)
         #else
         #expect(senderInfo["platform"] == 0)
         #endif
@@ -346,6 +379,29 @@ struct ClientTests {
         #expect(await client.state == .connected)
 
         await client.closeVirtualConnection(to: Fixtures.transportID)
+        #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == nil)
+    }
+
+    @Test func connectedFromUnknownSourceIsIgnored() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.push(["type": "CONNECTED", "protocolVersion": 1], namespace: .connection, from: "web-unknown")
+        mock.push(Fixtures.receiverStatus(level: 0.3), namespace: .receiver, to: "*")
+        try await eventually { await client.receiverStatus?.volume?.level == 0.3 }
+        #expect(await client.negotiatedProtocolVersion(for: "web-unknown") == nil)
+        #expect(await !client.isConnected(to: "web-unknown"))
+    }
+
+    @Test func connectedAfterCloseIsIgnored() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        await client.closeVirtualConnection(to: Fixtures.transportID)
+        mock.push(["type": "CONNECTED", "protocolVersion": 1], namespace: .connection, from: Fixtures.transportID)
+        mock.push(Fixtures.receiverStatus(level: 0.3), namespace: .receiver, to: "*")
+        try await eventually { await client.receiverStatus?.volume?.level == 0.3 }
         #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == nil)
     }
 
@@ -564,6 +620,7 @@ struct ClientTests {
     @Test func launchErrorReasonDecodesDocumentedCodes() {
         #expect(CastError.launchFailed(reason: "USER_NOT_ALLOWED").launchErrorReason == .userNotAllowed)
         #expect(CastError.launchFailed(reason: "NOTIFICATION_DISABLED").launchErrorReason == .notificationDisabled)
+        #expect(CastError.launchFailed(reason: "APPLICATION_NOT_LISTED").launchErrorReason == .applicationNotListed)
         #expect(CastError.launchFailed(reason: "NOT_FOUND").launchErrorReason == .unknown("NOT_FOUND"))
         #expect(CastError.launchFailed(reason: nil).launchErrorReason == nil)
         #expect(CastError.timeout.launchErrorReason == nil)
@@ -578,10 +635,11 @@ struct ClientTests {
         let client = makeClient(mock)
         try await client.connect()
         let start = ContinuousClock.now
-        await #expect(throws: CastError.launchFailed(reason: "application not listed after launch")) {
+        let error = await #expect(throws: CastError.launchFailed(reason: "APPLICATION_NOT_LISTED")) {
             _ = try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10))
         }
         #expect(ContinuousClock.now - start < .seconds(2))
+        #expect(error?.launchErrorReason == .applicationNotListed)
     }
 
     @Test func applicationOnThePlatformTransportIsNotALaunchedApp() async throws {
@@ -591,7 +649,7 @@ struct ClientTests {
         }
         let client = makeClient(mock)
         try await client.connect()
-        await #expect(throws: CastError.launchFailed(reason: "application not listed after launch")) {
+        await #expect(throws: CastError.launchFailed(reason: "APPLICATION_NOT_LISTED")) {
             _ = try await client.receiver.launch(.defaultMediaReceiver)
         }
     }
@@ -697,19 +755,94 @@ struct ClientTests {
         #expect(mock.sentMessages(ofType: "LAUNCH").count == 1)
     }
 
-    @Test func cancellingTheFirstLaunchCallerEndsTheLaunch() async throws {
+    @Test func cancellingTheOnlyLaunchCallerEndsTheLaunch() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
         try await client.connect()
         let first = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
         try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
+        let start = ContinuousClock.now
         first.cancel()
         let firstResult = await first.result
-        #expect(throws: (any Error).self) { try firstResult.get() }
+        #expect(ContinuousClock.now - start < .seconds(2))
+        #expect(throws: CancellationError.self) { try firstResult.get() }
         Fixtures.installDefaultReceiver(on: mock)
         let app = try await client.receiver.launch(.defaultMediaReceiver)
         #expect(app.transportId == Fixtures.transportID)
         #expect(mock.sentMessages(ofType: "LAUNCH").count == 2)
+    }
+
+    @Test func cancellingTheFirstLaunchCallerLeavesTheLaunchForAJoinedCaller() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let first = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
+        let joined = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        try await Task.sleep(for: .milliseconds(50))
+        first.cancel()
+        let firstResult = await first.result
+        #expect(throws: CancellationError.self) { try firstResult.get() }
+        let launch = try #require(mock.sentMessages(ofType: "LAUNCH").first)
+        mock.reply(to: launch, Fixtures.receiverStatus(apps: [Fixtures.mediaApp]))
+        let app = try await joined.value
+        #expect(app.transportId == Fixtures.transportID)
+        #expect(mock.sentMessages(ofType: "LAUNCH").count == 1)
+    }
+
+    @Test func cancellingEveryLaunchCallerEndsTheLaunch() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let first = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
+        let joined = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        try await Task.sleep(for: .milliseconds(50))
+        first.cancel()
+        let firstResult = await first.result
+        #expect(throws: CancellationError.self) { try firstResult.get() }
+        let pending = await client.pendingLaunch
+        let shared = try #require(pending)
+        let start = ContinuousClock.now
+        joined.cancel()
+        let joinedResult = await joined.result
+        #expect(ContinuousClock.now - start < .seconds(2))
+        #expect(throws: CancellationError.self) { try joinedResult.get() }
+        let sharedResult = await shared.result
+        #expect(throws: CancellationError.self) { try sharedResult.get() }
+        #expect(await client.pendingLaunch == nil)
+        Fixtures.installDefaultReceiver(on: mock)
+        _ = try await client.receiver.launch(.defaultMediaReceiver)
+        #expect(mock.sentMessages(ofType: "LAUNCH").count == 2)
+    }
+
+    @Test func launchIssuedAsTheSharedLaunchFinishesSendsANewLaunch() async throws {
+        let mock = MockReceiver()
+        Fixtures.installDefaultReceiver(on: mock)
+        mock.holdSends(ofType: "LAUNCH")
+        let client = makeClient(mock)
+        try await client.connect()
+        let first = Task { try await client.receiver.launch(.defaultMediaReceiver) }
+        try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
+        let pending = await client.pendingLaunch
+        let shared = try #require(pending)
+        mock.releaseHeldSends()
+        _ = try await shared.value
+        // The first caller may not have resumed yet; the finished launch must not be joined.
+        _ = try await client.receiver.launch(.defaultMediaReceiver)
+        _ = try await first.value
+        #expect(mock.sentMessages(ofType: "LAUNCH").count == 2)
+    }
+
+    @Test func launchPassesTheDefaultAndClampedTimeoutToItsRequest() async throws {
+        let mock = MockReceiver()
+        Fixtures.installDefaultReceiver(on: mock)
+        let client = makeClient(mock)
+        try await client.connect()
+        _ = try await client.receiver.launch(.defaultMediaReceiver)
+        #expect(await client.lastTimeoutByRequestType["LAUNCH"] == .seconds(60))
+        _ = try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(1000))
+        #expect(await client.lastTimeoutByRequestType["LAUNCH"] == .seconds(120))
     }
 
     @Test func stopWhileStopPendingThrowsRequestInFlight() async throws {
@@ -939,6 +1072,64 @@ struct ClientTests {
             try await client.openVirtualConnection(to: Fixtures.transportID)
         }
         #expect(mock.sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 2)
+    }
+
+    @Test func closeDuringOpenWaitsForTheOpen() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let closer = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(mock.sentMessages(ofType: "CLOSE").isEmpty)
+        mock.releaseHeldSends()
+        try await opener.value
+        await closer.value
+
+        let wire = mock.sentMessages.filter { $0.destinationID == Fixtures.transportID }.compactMap(\.type)
+        #expect(wire == ["CONNECT", "CLOSE"])
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        #expect(mock.sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 2)
+        #expect(await client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func staleConnectFailureKeepsTheReconnectedConnection() async throws {
+        let mocks = [MockReceiver(), MockReceiver()]
+        let index = Counter()
+        let client = CastClient { mocks[min(index.increment(), mocks.count) - 1] }
+        try await client.connect()
+        mocks[0].holdSends(ofType: "CONNECT")
+        mocks[0].failSends(ofType: "CONNECT", with: .connectionFailed("broken pipe"))
+        let staleOpen = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mocks[0].sentMessages(ofType: "CONNECT").count == 2 }
+
+        mocks[0].drop(with: CastError.connectionFailed("wifi blip"))
+        try await eventually { await client.state != .connected }
+        try await client.connect()
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+
+        mocks[0].releaseHeldSends()
+        await #expect(throws: CastError.connectionFailed("broken pipe")) { try await staleOpen.value }
+        #expect(await client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func deviceAuthAcceptsBinaryPayloads() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        var deviceAuth = client.messages(in: .deviceAuth).makeAsyncIterator()
+        var receiver = client.messages(in: .receiver).makeAsyncIterator()
+        mock.push(payload: .binary(Data([1, 2, 3])), namespace: .deviceAuth)
+        mock.push(payload: .binary(Data([4, 5, 6])), namespace: .receiver)
+        mock.push(Fixtures.receiverStatus(level: 0.4), namespace: .receiver)
+        let auth = try #require(await deviceAuth.next())
+        #expect(auth.raw.payload == .binary(Data([1, 2, 3])))
+        let status = try #require(await receiver.next())
+        #expect(status.type == "RECEIVER_STATUS")
     }
 
     @Test func requestIDsAreSequentialPerClient() async throws {

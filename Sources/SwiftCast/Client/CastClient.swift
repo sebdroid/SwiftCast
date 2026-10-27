@@ -37,11 +37,14 @@ public actor CastClient {
 
     /// Tunable client behavior.
     public struct Configuration: Sendable {
-        /// Interval between heartbeat `PING`s. Must be shorter than ``inactivityTimeout``.
+        /// Interval between heartbeat `PING`s.
         public var heartbeatInterval: Duration = .seconds(5)
         /// The connection is considered dead when nothing at all arrives
         /// within this long of a `PING` being sent. Any inbound message, not
         /// only `PONG`, counts as a sign of life.
+        ///
+        /// A dead receiver is noticed within this long of the next `PING`, so
+        /// at most ``heartbeatInterval`` plus this long after its last message.
         public var inactivityTimeout: Duration = .seconds(10)
         /// Default time to wait for a response to a request, such as a
         /// platform receiver request or a request on a custom namespace.
@@ -85,6 +88,13 @@ public actor CastClient {
         let requestID: Int
     }
 
+    private struct LaunchInFlight {
+        let id: Int
+        let appID: CastAppID
+        let task: Task<CastApplication, any Error>
+        var waiters = 1
+    }
+
     private struct PendingRequest {
         let continuation: CheckedContinuation<InboundMessage, any Error>
         let timeoutTask: Task<Void, Never>
@@ -111,8 +121,11 @@ public actor CastClient {
     private var nextRequestID = 1
     private var connectedDestinations: Set<String> = []
     private var connectsInFlight: [String: Task<Void, any Error>] = [:]
-    private var launchInFlight: (appID: CastAppID, task: Task<CastApplication, any Error>)?
+    private var launchInFlight: LaunchInFlight?
+    private var nextLaunchID = 0
     private var protocolVersions: [String: Int] = [:]
+    /// The timeout the latest request of each payload `type` was given, for tests.
+    private(set) var lastTimeoutByRequestType: [String: Duration] = [:]
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var nextPing = ContinuousClock.now
@@ -131,10 +144,6 @@ public actor CastClient {
         configuration: Configuration = Configuration(),
         makeTransport: @escaping @Sendable () -> any CastTransport
     ) {
-        precondition(
-            configuration.heartbeatInterval < configuration.inactivityTimeout,
-            "heartbeatInterval must be shorter than inactivityTimeout"
-        )
         self.senderID = senderID
         self.configuration = configuration
         self.makeTransport = makeTransport
@@ -324,6 +333,7 @@ public actor CastClient {
         object["requestId"] = .number(Double(requestID))
         let message = try Self.makeMessage(JSONValue.object(object), source: senderID, namespace: namespace, destination: destination)
         let timeout = timeout ?? configuration.requestTimeout
+        if let type { lastTimeoutByRequestType[type] = timeout }
 
         let response = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<InboundMessage, any Error>) in
@@ -369,6 +379,7 @@ public actor CastClient {
             return try await inFlight.value
         }
         guard !connectedDestinations.contains(destination) else { return }
+        let generation = generation
         // Registered before the write so a message the peer sends as soon as
         // it sees CONNECT is not dropped as coming from an unknown peer.
         connectedDestinations.insert(destination)
@@ -376,18 +387,28 @@ public actor CastClient {
         let write = Task { try await sendJSON(payload, namespace: .connection, to: destination) }
         connectsInFlight[destination] = write
         defer {
-            if connectsInFlight[destination] == write { connectsInFlight[destination] = nil }
+            if self.generation == generation, connectsInFlight[destination] == write { connectsInFlight[destination] = nil }
         }
         do {
             try await write.value
         } catch {
-            connectedDestinations.remove(destination)
+            // After a reconnect the entry belongs to the new connection.
+            if self.generation == generation {
+                connectedDestinations.remove(destination)
+                protocolVersions[destination] = nil
+            }
             throw error
         }
     }
 
-    /// Closes the virtual connection to `destination`.
+    /// Closes the virtual connection to `destination`. If the connection is
+    /// still opening, this waits for the open to finish first.
     public func closeVirtualConnection(to destination: String) async {
+        if let inFlight = connectsInFlight[destination] {
+            let generation = generation
+            _ = try? await inFlight.value
+            guard self.generation == generation else { return }
+        }
         guard connectedDestinations.remove(destination) != nil else { return }
         protocolVersions[destination] = nil
         try? await sendJSON(Self.closePayload, namespace: .connection, to: destination)
@@ -415,6 +436,10 @@ public actor CastClient {
 
     /// Joins `appID` if it is already running, otherwise launches it, and
     /// returns a media controller for it.
+    ///
+    /// A launch shared with other callers (see ``ReceiverController/launch(_:timeout:onStatus:)``)
+    /// is cancelled only when every caller waiting on it has been cancelled;
+    /// a cancelled call throws `CancellationError` straight away.
     public func launchMediaApp(_ appID: CastAppID = .defaultMediaReceiver) async throws -> MediaController {
         let status = try await receiver.getStatus()
         let application: CastApplication
@@ -427,26 +452,58 @@ public actor CastClient {
     }
 
     /// Runs `start` as the client's one pending launch, or joins the pending
-    /// launch of the same app. Cancelling the caller that started it cancels
-    /// the launch for every caller. A cancelled joined caller throws
-    /// `CancellationError` straight away and leaves the launch running.
+    /// launch of the same app. A cancelled caller, whether it started the
+    /// launch or joined it, throws `CancellationError` straight away and
+    /// stops waiting; the launch itself is cancelled only when every caller
+    /// waiting on it has been cancelled.
     func coalescedLaunch(
         _ appID: CastAppID,
         _ start: @escaping @Sendable () async throws -> CastApplication
     ) async throws -> CastApplication {
+        let id: Int
+        let task: Task<CastApplication, any Error>
         if let launchInFlight {
             guard launchInFlight.appID == appID else { throw CastError.requestInFlight("LAUNCH") }
-            return try await joinedValue(of: launchInFlight.task)
+            id = launchInFlight.id
+            task = launchInFlight.task
+            self.launchInFlight?.waiters += 1
+        } else {
+            nextLaunchID += 1
+            id = nextLaunchID
+            // Cleared from inside the task so no caller can join it once it has finished.
+            task = Task { [weak self] in
+                do {
+                    let application = try await start()
+                    await self?.endLaunch(id)
+                    return application
+                } catch {
+                    await self?.endLaunch(id)
+                    throw error
+                }
+            }
+            launchInFlight = LaunchInFlight(id: id, appID: appID, task: task)
         }
-        let task = Task { try await start() }
-        launchInFlight = (appID, task)
-        defer {
-            if launchInFlight?.task == task { launchInFlight = nil }
-        }
-        return try await withTaskCancellationHandler {
-            try await task.value
-        } onCancel: {
-            task.cancel()
+        defer { leaveLaunch(id) }
+        return try await joinedValue(of: task)
+    }
+
+    /// The task of the pending launch, for tests.
+    var pendingLaunch: Task<CastApplication, any Error>? { launchInFlight?.task }
+
+    private func endLaunch(_ id: Int) {
+        if launchInFlight?.id == id { launchInFlight = nil }
+    }
+
+    /// A launch still pending when its last waiter leaves has only cancelled
+    /// waiters, since a finished launch clears itself before its result is delivered.
+    private func leaveLaunch(_ id: Int) {
+        guard launchInFlight?.id == id, var launch = launchInFlight else { return }
+        launch.waiters -= 1
+        if launch.waiters == 0 {
+            launchInFlight = nil
+            launch.task.cancel()
+        } else {
+            launchInFlight = launch
         }
     }
 
@@ -485,7 +542,7 @@ public actor CastClient {
                 "version": .string(Self.version),
                 "browserVersion": .string(Self.version),
                 "platform": .number(Double(Self.senderPlatform)),
-                "systemVersion": .string(ProcessInfo.processInfo.operatingSystemVersionString),
+                "systemVersion": .string(Self.systemVersion),
                 "connectionType": 1,
             ],
         ]
@@ -497,8 +554,12 @@ public actor CastClient {
     }
 
     static var defaultUserAgent: String {
+        "SwiftCast/\(version) (\(osName) \(systemVersion))"
+    }
+
+    static var systemVersion: String {
         let os = ProcessInfo.processInfo.operatingSystemVersion
-        return "SwiftCast/\(version) (\(osName) \(os.majorVersion).\(os.minorVersion).\(os.patchVersion))"
+        return "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
     }
 
     private static var osName: String {
@@ -519,12 +580,16 @@ public actor CastClient {
         #endif
     }
 
-    /// The sender platform enum from chromium's cast channel code: 2 is iOS, 4 is macOS.
+    /// The `senderInfo.platform` value. Open screen's message_util.cc uses 2 for iOS,
+    /// 4 for macOS and 6 for linux; chromium sends 4 for every apple build and also
+    /// uses 6 for linux.
     static var senderPlatform: Int {
         #if os(iOS) || os(tvOS) || os(visionOS)
         2
         #elseif os(macOS)
         4
+        #elseif os(Linux)
+        6
         #else
         0
         #endif
@@ -604,13 +669,13 @@ public actor CastClient {
         case .heartbeat:
             if message.type == "PING" {
                 let generation = generation
-                Task { _ = await sendHeartbeat("PONG", to: message.sourceID, generation: generation) }
+                Task { await sendHeartbeat("PONG", to: message.sourceID, generation: generation) }
             }
             return
         case .connection:
             switch message.type {
             case "CONNECTED":
-                if let version = message.json?["protocolVersion"]?.intValue {
+                if connectedDestinations.contains(message.sourceID), let version = message.json?["protocolVersion"]?.intValue {
                     protocolVersions[message.sourceID] = version
                 }
             case "CLOSE":
@@ -637,9 +702,13 @@ public actor CastClient {
     }
 
     /// Whether an inbound message may be routed at all. Messages for other
-    /// senders, from peers without a virtual connection, or with a payload a
-    /// Google namespace cannot carry are dropped, as chromium's and open
-    /// screen's cast channel code do.
+    /// senders, or with a payload a Google namespace cannot carry, are dropped
+    /// as chromium's and open screen's cast channel code do. Messages from
+    /// peers without a virtual connection are dropped too, `*` broadcasts
+    /// included. That is stricter than open screen's
+    /// virtual_connection_router.cc, which still delivers broadcasts to every
+    /// endpoint, but no controller here needs a broadcast from a peer it has
+    /// not connected to.
     private func accepts(_ message: InboundMessage) -> Bool {
         let namespace = message.namespace
         guard message.destinationID == senderID || message.destinationID == CastEndpoint.broadcast else {
@@ -674,7 +743,10 @@ public actor CastClient {
 
     /// Sends a `PING` when one is due and enforces the inactivity deadline.
     /// Returns when the heartbeat loop should wake next, or `nil` to stop it.
-    private func heartbeatTick(generation: Int) async -> ContinuousClock.Instant? {
+    ///
+    /// The `PING` is written from its own task so a write that never
+    /// completes cannot hold up the deadline check.
+    private func heartbeatTick(generation: Int) -> ContinuousClock.Instant? {
         guard generation == self.generation, state == .connected else { return nil }
         let now = ContinuousClock.now
         if let inactivityDeadline, now >= inactivityDeadline {
@@ -686,7 +758,7 @@ public actor CastClient {
             if inactivityDeadline == nil {
                 inactivityDeadline = now + configuration.inactivityTimeout
             }
-            guard await sendHeartbeat("PING", to: CastEndpoint.platformReceiver, generation: generation) else { return nil }
+            Task { await sendHeartbeat("PING", to: CastEndpoint.platformReceiver, generation: generation) }
         }
         guard let inactivityDeadline else { return nextPing }
         return min(nextPing, inactivityDeadline)
@@ -694,14 +766,12 @@ public actor CastClient {
 
     /// A failed heartbeat write means the socket is unusable, so the client
     /// is torn down at once instead of waiting for the inactivity timeout.
-    private func sendHeartbeat(_ type: String, to destination: String, generation: Int) async -> Bool {
+    private func sendHeartbeat(_ type: String, to destination: String, generation: Int) async {
         do {
             try await sendJSON(["type": .string(type)], namespace: .heartbeat, to: destination)
-            return true
         } catch {
             let reason = if case .connectionFailed(let message)? = error as? CastError { message } else { error.localizedDescription }
             teardown(error: .connectionFailed("heartbeat write failed: \(reason)"), generation: generation)
-            return false
         }
     }
 

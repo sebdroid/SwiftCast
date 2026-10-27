@@ -170,7 +170,9 @@ public final class CastSession {
 
     // MARK: - Playback
 
-    /// Loads media, launching ``appID`` on the receiver if necessary.
+    /// Loads media, launching ``appID`` on the receiver if necessary. A launch
+    /// shared with other callers is cancelled only when every caller waiting
+    /// on it has been cancelled.
     @discardableResult
     public func load(
         _ media: MediaInformation,
@@ -185,7 +187,9 @@ public final class CastSession {
         return status
     }
 
-    /// Loads a queue, launching ``appID`` on the receiver if necessary.
+    /// Loads a queue, launching ``appID`` on the receiver if necessary. A launch
+    /// shared with other callers is cancelled only when every caller waiting
+    /// on it has been cancelled.
     @discardableResult
     public func loadQueue(_ items: [QueueItem], startIndex: Int = 0, repeatMode: RepeatMode = .off) async throws -> MediaStatus {
         let controller = try await ensureMediaController()
