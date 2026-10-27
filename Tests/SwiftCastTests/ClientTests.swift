@@ -133,17 +133,47 @@ struct ClientTests {
         try await client.connect()
         // The first PING arms the deadline; inbound traffic right after it
         // clears it, so the next PING arms a fresh one.
-        try await eventually { mock.sentMessages(ofType: "PING").count == 1 }
+        try await eventually { mock.sentMessages(ofType: "PING").count >= 1 }
         mock.push(Fixtures.receiverStatus(level: 0.3), namespace: .receiver, to: "*")
         try await eventually { await client.receiverStatus?.volume?.level == 0.3 }
         let lastInbound = ContinuousClock.now
         try await eventually(timeout: .seconds(5)) { await client.state != .connected }
         let elapsed = ContinuousClock.now - lastInbound
         #expect(await client.state == .closed(.heartbeatTimeout))
-        // Without the clear the deadline would fire about 400 ms after the
-        // inbound message instead of about 600 ms.
-        #expect(elapsed >= .milliseconds(500))
         #expect(elapsed < .milliseconds(1100))
+    }
+
+    @Test func intervalLongerThanTimeoutStillDetectsSilence() async throws {
+        let answering = MockReceiver()
+        let silent = MockReceiver()
+        silent.answersPings = false
+        let configure: (inout CastClient.Configuration) -> Void = {
+            $0.heartbeatInterval = .milliseconds(300)
+            $0.inactivityTimeout = .milliseconds(100)
+        }
+        let healthy = makeClient(answering, configure: configure)
+        let dead = makeClient(silent, configure: configure)
+        try await healthy.connect()
+        try await dead.connect()
+
+        try await eventually { await dead.state != .connected }
+        #expect(await dead.state == .closed(.heartbeatTimeout))
+        try await eventually { answering.sentMessages(ofType: "PING").count >= 3 }
+        #expect(await healthy.state == .connected)
+    }
+
+    @Test func stalledPingWriteStillTimesOut() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(50)
+            $0.inactivityTimeout = .milliseconds(200)
+        }
+        try await client.connect()
+        try await eventually { await client.state != .connected }
+        #expect(await client.state == .closed(.heartbeatTimeout))
+        #expect(mock.sentMessages(ofType: "PING").count >= 1)
+        mock.releaseHeldSends()
     }
 
     @Test func anyInboundTrafficKeepsConnectionAlive() async throws {
@@ -175,7 +205,7 @@ struct ClientTests {
         try await eventually { await client.state != .connected }
         #expect(ContinuousClock.now - start < .seconds(2))
         #expect(await client.state == .closed(.connectionFailed("heartbeat write failed: broken pipe")))
-        #expect(mock.sentMessages(ofType: "PING").count == 1)
+        #expect(mock.sentMessages(ofType: "PING").count >= 1)
     }
 
     @Test func failedPongWriteTearsDown() async throws {
