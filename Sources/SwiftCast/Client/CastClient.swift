@@ -102,14 +102,19 @@ public actor CastClient {
     }
 
     /// The client's one pending launch. Each caller waiting on it is keyed
-    /// by a token and keeps its own `onStatus`. A launch with no waiters left
+    /// by a token and keeps its own `LaunchWaiter`. A launch with no waiters left
     /// has been cancelled and stays recorded until its `LAUNCH` leaves
     /// `pending`, so a new launch cannot collide with it.
     private struct LaunchInFlight {
         let id: Int
         let appID: CastAppID
         let task: Task<CastApplication, any Error>
-        var waiters: [Int: (@Sendable (String) -> Void)?]
+        var waiters: [Int: LaunchWaiter]
+    }
+
+    private struct OpenInFlight {
+        let write: Task<Void, any Error>
+        let completion: OpenCompletion
     }
 
     private struct PendingRequest {
@@ -133,6 +138,10 @@ public actor CastClient {
         /// Runs on the client as the request leaves `pending`, whatever the
         /// outcome, before its caller resumes.
         var onSettled: (@Sendable (isolated CastClient) -> Void)?
+        /// Runs on the client once the request is registered and its write
+        /// scheduled, before that write runs. Tests use it to land a
+        /// cancellation in that gap.
+        var onRegistered: (@Sendable (isolated CastClient) -> Void)?
     }
 
     private let makeTransport: @Sendable () -> any CastTransport
@@ -142,7 +151,8 @@ public actor CastClient {
     private var pending: [PendingKey: PendingRequest] = [:]
     private var nextRequestID = 1
     private var connectedDestinations: Set<String> = []
-    private var connectsInFlight: [String: Task<Void, any Error>] = [:]
+    private var connectsInFlight: [String: OpenInFlight] = [:]
+    private var virtualConnectionIntents: [String: Int] = [:]
     private(set) var closesAwaitingOpen = 0
     private var launchInFlight: LaunchInFlight?
     private var nextLaunchID = 0
@@ -337,6 +347,8 @@ public actor CastClient {
     ///
     /// Standard Cast error responses (`LAUNCH_ERROR`, `LOAD_FAILED`,
     /// `INVALID_REQUEST`, …) are thrown as ``CastError``.
+    ///
+    /// A request cancelled before its message is written is not written at all.
     public func request(
         _ payload: some Encodable & Sendable,
         namespace: CastNamespace,
@@ -366,6 +378,7 @@ public actor CastClient {
         let message = try Self.makeMessage(JSONValue.object(object), source: senderID, namespace: namespace, destination: destination)
         let timeout = timeout ?? configuration.requestTimeout
         if let type { lastTimeoutByRequestType[type] = timeout }
+        let cancelled = OSAllocatedUnfairLock(initialState: false)
 
         let response = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<InboundMessage, any Error>) in
@@ -386,14 +399,24 @@ public actor CastClient {
                     return
                 }
                 Task {
+                    // The caller may have been cancelled, or the request
+                    // settled, after registration; it is then never written.
+                    // The flag covers a cancellation whose resolve has not
+                    // reached the client yet.
+                    guard self.pending[key] != nil else { return }
+                    guard !cancelled.withLock({ $0 }) else {
+                        return self.resolve(key, with: .failure(CancellationError()))
+                    }
                     do {
                         try await self.sendRaw(message)
                     } catch {
                         self.resolve(key, with: .failure(error))
                     }
                 }
+                options.onRegistered?(self)
             }
         } onCancel: {
+            cancelled.withLock { $0 = true }
             Task { await self.resolve(key, with: .failure(CancellationError())) }
         }
 
@@ -405,56 +428,106 @@ public actor CastClient {
 
     /// Opens a virtual connection to `destination` (e.g. an app's `transportId`).
     /// Does nothing if one is already open. A call made while another is still
-    /// opening the same connection waits for it and shares its result.
+    /// opening the same connection waits for it and shares its result, then
+    /// opens again if the connection was closed before it resumed and no later
+    /// open or close has been issued.
     public func openVirtualConnection(to destination: String) async throws {
-        if let inFlight = connectsInFlight[destination] {
-            return try await inFlight.value
+        try await openConnection(to: destination)
+    }
+
+    /// Returns the intent this call recorded when it wrote the `CONNECT`
+    /// itself, or `nil` when it found the connection open or shared the
+    /// write of another call.
+    @discardableResult
+    private func openConnection(to destination: String) async throws -> Int? {
+        let intent = recordIntent(for: destination)
+        for _ in 0..<2 {
+            guard let inFlight = connectsInFlight[destination] else { break }
+            let generation = generation
+            try await inFlight.write.value
+            guard self.generation == generation, virtualConnectionIntents[destination] == intent,
+                  !connectedDestinations.contains(destination) else { return nil }
         }
-        guard !connectedDestinations.contains(destination) else { return }
+        guard !connectedDestinations.contains(destination) else { return nil }
         let generation = generation
         // Registered before the write so a message the peer sends as soon as
         // it sees CONNECT is not dropped as coming from an unknown peer.
         connectedDestinations.insert(destination)
         let payload = connectPayload(to: destination)
-        let write = Task { try await sendJSON(payload, namespace: .connection, to: destination) }
-        connectsInFlight[destination] = write
-        defer {
-            if self.generation == generation, connectsInFlight[destination] == write { connectsInFlight[destination] = nil }
-        }
-        do {
-            try await write.value
-        } catch {
-            // After a reconnect the entry belongs to the new connection.
-            if self.generation == generation {
-                connectedDestinations.remove(destination)
-                protocolVersions[destination] = nil
+        let completion = OpenCompletion()
+        let write = Task {
+            let result: Result<Void, any Error>
+            do {
+                try await sendJSON(payload, namespace: .connection, to: destination)
+                result = .success(())
+            } catch {
+                result = .failure(error)
             }
-            throw error
+            // Settled here, before any waiter resumes, so nothing can observe
+            // a finished open that is still listed as in flight. After a
+            // reconnect the entries belong to the new connection.
+            if self.generation == generation {
+                if connectsInFlight[destination]?.completion === completion { connectsInFlight[destination] = nil }
+                if case .failure = result {
+                    connectedDestinations.remove(destination)
+                    protocolVersions[destination] = nil
+                }
+            }
+            completion.finish(result)
+            try result.get()
         }
+        connectsInFlight[destination] = OpenInFlight(write: write, completion: completion)
+        try await write.value
+        return intent
     }
 
     /// Closes the virtual connection to `destination`.
     ///
     /// A close issued while the connection is still opening takes effect
     /// only after that open completes, so the wire order is always `CONNECT`
-    /// then `CLOSE`. If that open fails there is nothing to close. A close
-    /// cancelled while it waits returns at once and changes nothing: the
-    /// connection stays as the open leaves it.
+    /// then `CLOSE`. If that open fails, or another open or close of the same
+    /// destination is issued while it waits, it does nothing: the later call
+    /// decides the outcome. A close cancelled while it waits returns at once
+    /// and changes nothing: the connection stays as the open leaves it, and
+    /// it does not count as a later call for closes that are still waiting.
     public func closeVirtualConnection(to destination: String) async {
+        let intent = recordIntent(for: destination)
         if let inFlight = connectsInFlight[destination] {
             let generation = generation
             closesAwaitingOpen += 1
             defer { closesAwaitingOpen -= 1 }
             do {
-                try await awaitingCancellation(of: inFlight)
+                try await inFlight.completion.wait()
             } catch {
+                // A cancelled close decides nothing, so it must not supersede
+                // an earlier close still waiting. Only the latest call can be
+                // undone, so a later call keeps superseding as before.
+                if error is CancellationError, virtualConnectionIntents[destination] == intent {
+                    virtualConnectionIntents[destination] = intent - 1
+                }
                 return
             }
-            guard self.generation == generation else { return }
+            guard self.generation == generation, virtualConnectionIntents[destination] == intent else { return }
         }
         guard connectedDestinations.remove(destination) != nil else { return }
         protocolVersions[destination] = nil
         try? await sendJSON(Self.closePayload, namespace: .connection, to: destination)
+    }
+
+    private func recordIntent(for destination: String) -> Int {
+        let intent = virtualConnectionIntents[destination, default: 0] + 1
+        virtualConnectionIntents[destination] = intent
+        return intent
+    }
+
+    /// How many open and close calls have been issued for `destination`.
+    func virtualConnectionIntent(for destination: String) -> Int {
+        virtualConnectionIntents[destination, default: 0]
+    }
+
+    /// How many closes are suspended on the in-flight open of `destination`.
+    func closesWaitingOnOpen(to destination: String) -> Int {
+        connectsInFlight[destination]?.completion.waiterCount ?? 0
     }
 
     /// Whether a virtual connection to `destination` is currently open.
@@ -471,13 +544,29 @@ public actor CastClient {
     /// virtual connection to it and fetching its current media status.
     ///
     /// A failed status fetch still returns the controller, but a cancelled
-    /// call throws `CancellationError`.
+    /// call throws `CancellationError`. A cancelled call that wrote the
+    /// application's `CONNECT` itself closes that virtual connection again
+    /// before it throws, unless another open or close of it has been issued
+    /// since, as by a concurrent call for the same application. A cancelled
+    /// call that found the connection already open, or shared another
+    /// call's `CONNECT`, leaves it as it is. As with
+    /// ``MediaController/detach()``, that `CLOSE` can end an application
+    /// whose last connected sender this client was.
     public func mediaController(for application: CastApplication) async throws -> MediaController {
-        try await openVirtualConnection(to: application.transportId)
+        let destination = application.transportId
+        let generation = generation
+        let openedIntent = try await openConnection(to: destination)
         let controller = MediaController(client: self, application: application)
         await controller.start()
         _ = try? await controller.refreshStatus()
-        try Task.checkCancellation()
+        if Task.isCancelled {
+            // Checked and closed without suspending in between, so an open
+            // issued meanwhile always keeps the connection.
+            if let openedIntent, self.generation == generation, virtualConnectionIntents[destination] == openedIntent {
+                await closeVirtualConnection(to: destination)
+            }
+            throw CancellationError()
+        }
         return controller
     }
 
@@ -488,6 +577,9 @@ public actor CastClient {
     /// is cancelled only when every caller waiting on it has been cancelled.
     /// A cancelled call throws `CancellationError` straight away, at any
     /// stage, and stops receiving that launch's `LAUNCH_STATUS` updates.
+    /// Cancelled while it attaches, it first closes the application's
+    /// virtual connection as ``mediaController(for:)`` does, waiting only for
+    /// that write. It never stops an application it launched.
     public func launchMediaApp(_ appID: CastAppID = .defaultMediaReceiver) async throws -> MediaController {
         let status = try await receiver.getStatus()
         let application: CastApplication
@@ -507,7 +599,8 @@ public actor CastClient {
     /// throws `CancellationError` straight away and stops waiting; the
     /// launch itself is cancelled only when every caller waiting on it has
     /// been cancelled. `onStatus` receives each `LAUNCH_STATUS` update that
-    /// arrives while its caller is still waiting.
+    /// arrives while its caller is still waiting: none handled after its
+    /// cancellation has been requested.
     func coalescedLaunch(
         _ appID: CastAppID,
         onStatus: (@Sendable (String) -> Void)?,
@@ -520,13 +613,14 @@ public actor CastClient {
         }
         nextLaunchWaiter += 1
         let waiter = nextLaunchWaiter
+        let launchWaiter = LaunchWaiter(onStatus: onStatus)
         let id: Int
         let task: Task<CastApplication, any Error>
         if let launchInFlight {
             guard launchInFlight.appID == appID else { throw CastError.requestInFlight("LAUNCH") }
             id = launchInFlight.id
             task = launchInFlight.task
-            self.launchInFlight?.waiters[waiter] = onStatus
+            self.launchInFlight?.waiters[waiter] = launchWaiter
         } else {
             nextLaunchID += 1
             id = nextLaunchID
@@ -541,10 +635,16 @@ public actor CastClient {
                     throw error
                 }
             }
-            launchInFlight = LaunchInFlight(id: id, appID: appID, task: task, waiters: [waiter: onStatus])
+            launchInFlight = LaunchInFlight(id: id, appID: appID, task: task, waiters: [waiter: launchWaiter])
         }
         defer { leaveLaunch(id, waiter: waiter) }
-        return try await awaitingCancellation(of: task)
+        return try await withTaskCancellationHandler {
+            try await awaitingCancellation(of: task)
+        } onCancel: {
+            // `leaveLaunch` only runs once this caller is back on the client,
+            // so statuses handled before then must already pass it by.
+            launchWaiter.depart()
+        }
     }
 
     /// The task of the pending launch, for tests.
@@ -571,7 +671,7 @@ public actor CastClient {
 
     private func deliverLaunchStatus(_ status: String, launch id: Int) {
         guard let launch = launchInFlight, launch.id == id else { return }
-        for onStatus in launch.waiters.values { onStatus?(status) }
+        for waiter in launch.waiters.values where !waiter.hasDeparted { waiter.onStatus?(status) }
     }
 
     /// Also run from the launch task, for a `start` that fails before its request settles.
@@ -949,5 +1049,71 @@ private func awaitingCancellation<Success: Sendable>(of task: Task<Success, any 
             guard case .suspended(let continuation) = state else { return nil }
             return continuation
         }?.resume(throwing: CancellationError())
+    }
+}
+
+/// A caller waiting on a launch. It is marked departed by its cancellation
+/// handler, synchronously, so status fan-out skips it at once.
+private final class LaunchWaiter: Sendable {
+    let onStatus: (@Sendable (String) -> Void)?
+    private let departed = OSAllocatedUnfairLock(initialState: false)
+
+    init(onStatus: (@Sendable (String) -> Void)?) {
+        self.onStatus = onStatus
+    }
+
+    var hasDeparted: Bool { departed.withLock { $0 } }
+
+    func depart() { departed.withLock { $0 = true } }
+}
+
+/// Lets closes wait for an in-flight open without owning its write.
+/// `Task.value` ignores the waiter's cancellation, so a cancelled waiter is
+/// resumed and dropped here at once instead of lingering until the write ends.
+private final class OpenCompletion: Sendable {
+    private struct State: Sendable {
+        var result: Result<Void, any Error>?
+        var waiters: [Int: CheckedContinuation<Void, any Error>] = [:]
+        var cancelled: Set<Int> = []
+        var nextID = 0
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    var waiterCount: Int { state.withLock { $0.waiters.count } }
+
+    func finish(_ result: Result<Void, any Error>) {
+        let waiters = state.withLock { state in
+            state.result = result
+            defer { state.waiters = [:] }
+            return Array(state.waiters.values)
+        }
+        for waiter in waiters { waiter.resume(with: result) }
+    }
+
+    func wait() async throws {
+        let id = state.withLock { state in
+            defer { state.nextID += 1 }
+            return state.nextID
+        }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                let ready = state.withLock { state -> Result<Void, any Error>? in
+                    if state.cancelled.remove(id) != nil { return .failure(CancellationError()) }
+                    if let result = state.result { return result }
+                    state.waiters[id] = continuation
+                    return nil
+                }
+                if let ready { continuation.resume(with: ready) }
+            }
+        } onCancel: {
+            // Each continuation is taken out under the lock exactly once, by
+            // either this handler or `finish`, so it is never resumed twice.
+            state.withLock { state -> CheckedContinuation<Void, any Error>? in
+                if let waiter = state.waiters.removeValue(forKey: id) { return waiter }
+                state.cancelled.insert(id)
+                return nil
+            }?.resume(throwing: CancellationError())
+        }
     }
 }
