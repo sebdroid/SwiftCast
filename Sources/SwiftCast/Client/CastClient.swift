@@ -211,6 +211,7 @@ public actor CastClient {
         }
         generation += 1
         let currentGeneration = generation
+        reopenStreams()
         setState(.connecting)
         decoder = FrameDecoder()
         connectedDestinations = []
@@ -284,16 +285,19 @@ public actor CastClient {
     /// Streams connection state changes, starting with the current state.
     ///
     /// A stream made before the connection closes ends right after it
-    /// delivers the `.closed` state. To follow a reconnect, subscribe again
-    /// after calling ``connect()``.
+    /// delivers the `.closed` state, and one made while the client is closed
+    /// delivers that state and ends at once. To follow a reconnect, subscribe
+    /// again after calling ``connect()``.
     public func stateUpdates() -> AsyncStream<State> {
         stateBroadcaster.subscribe(initial: state)
     }
 
     /// Streams receiver status updates, starting with the latest known status.
     ///
-    /// A stream made before the connection closes ends when it closes.
-    /// To follow a reconnect, subscribe again after calling ``connect()``.
+    /// A stream made before the connection closes ends when it closes, and
+    /// one made while the client is closed delivers the latest known status,
+    /// if any, and ends at once. To follow a reconnect, subscribe again after
+    /// calling ``connect()``.
     public func receiverStatusUpdates() -> AsyncStream<ReceiverStatus> {
         receiverStatusBroadcaster.subscribe(initial: receiverStatus)
     }
@@ -309,7 +313,8 @@ public actor CastClient {
     /// are not a JSON object are dropped; custom namespaces receive every
     /// payload as is, with ``InboundMessage/json`` `nil` when it is not JSON.
     ///
-    /// Streams end when the connection closes.
+    /// Streams end when the connection closes. A stream made while the client
+    /// is closed ends at once; subscribe again after calling ``connect()``.
     public nonisolated func messages(in namespace: CastNamespace? = nil) -> AsyncStream<InboundMessage> {
         let all = messageBroadcaster.subscribe()
         guard let namespace else { return all }
@@ -987,10 +992,28 @@ public actor CastClient {
 
     /// Ends every current subscription once `.closed` has been yielded, so a
     /// watcher left on a dead connection does not keep the client alive.
+    /// Subscriptions made before the next ``connect()`` end at once too, as
+    /// nothing would ever end them otherwise.
     private func finishStreams() {
-        messageBroadcaster.finishAll()
-        stateBroadcaster.finishAll()
-        receiverStatusBroadcaster.finishAll()
+        messageBroadcaster.close()
+        guard !keepsObservationStreamsOpenOnClose else { return }
+        stateBroadcaster.close()
+        receiverStatusBroadcaster.close()
+    }
+
+    private func reopenStreams() {
+        messageBroadcaster.reopen()
+        stateBroadcaster.reopen()
+        receiverStatusBroadcaster.reopen()
+    }
+
+    /// Leaves ``stateUpdates()`` and ``receiverStatusUpdates()`` streams open
+    /// across a close, so tests can check that a watcher is released by
+    /// whoever owns it rather than by the stream ending.
+    private(set) var keepsObservationStreamsOpenOnClose = false
+
+    func keepObservationStreamsOpenOnClose() {
+        keepsObservationStreamsOpenOnClose = true
     }
 
     /// How many ``stateUpdates()`` and ``receiverStatusUpdates()`` streams are open, for tests.
