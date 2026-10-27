@@ -306,8 +306,15 @@ public actor CastClient {
     /// Does nothing if one is already open.
     public func openVirtualConnection(to destination: String) async throws {
         guard !connectedDestinations.contains(destination) else { return }
-        try await sendJSON(connectPayload(to: destination), namespace: .connection, to: destination)
+        // Inserted before sending so a CONNECTED reply handled while the send is suspended is recorded.
         connectedDestinations.insert(destination)
+        do {
+            try await sendJSON(connectPayload(to: destination), namespace: .connection, to: destination)
+        } catch {
+            connectedDestinations.remove(destination)
+            protocolVersions[destination] = nil
+            throw error
+        }
     }
 
     /// Closes the virtual connection to `destination`.
@@ -380,7 +387,7 @@ public actor CastClient {
                 "version": .string(Self.version),
                 "browserVersion": .string(Self.version),
                 "platform": .number(Double(Self.senderPlatform)),
-                "systemVersion": .string(ProcessInfo.processInfo.operatingSystemVersionString),
+                "systemVersion": .string(Self.systemVersion),
                 "connectionType": 1,
             ],
         ]
@@ -392,8 +399,12 @@ public actor CastClient {
     }
 
     static var defaultUserAgent: String {
+        "SwiftCast/\(version) (\(osName) \(systemVersion))"
+    }
+
+    static var systemVersion: String {
         let os = ProcessInfo.processInfo.operatingSystemVersion
-        return "SwiftCast/\(version) (\(osName) \(os.majorVersion).\(os.minorVersion).\(os.patchVersion))"
+        return "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
     }
 
     private static var osName: String {
@@ -414,12 +425,16 @@ public actor CastClient {
         #endif
     }
 
-    /// The sender platform enum from chromium's cast channel code: 2 is iOS, 4 is macOS.
+    /// The `senderInfo.platform` value. Open screen's message_util.cc uses 2 for iOS,
+    /// 4 for macOS and 6 for linux; chromium sends 4 for every apple build and also
+    /// uses 6 for linux.
     static var senderPlatform: Int {
         #if os(iOS) || os(tvOS) || os(visionOS)
         2
         #elseif os(macOS)
         4
+        #elseif os(Linux)
+        6
         #else
         0
         #endif
@@ -487,7 +502,7 @@ public actor CastClient {
         case .connection:
             switch message.type {
             case "CONNECTED":
-                if let version = message.json?["protocolVersion"]?.intValue {
+                if connectedDestinations.contains(message.sourceID), let version = message.json?["protocolVersion"]?.intValue {
                     protocolVersions[message.sourceID] = version
                 }
             case "CLOSE":
