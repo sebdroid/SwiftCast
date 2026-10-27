@@ -867,13 +867,101 @@ struct ClientTests {
         let closer = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
         try await eventually { await client.closesAwaitingOpen == 1 }
 
+        #expect(await client.closesWaitingOnOpen(to: Fixtures.transportID) == 1)
         closer.cancel()
-        try await eventually { await client.closesAwaitingOpen == 0 }
+        await closer.value
+        #expect(await client.closesAwaitingOpen == 0)
+        #expect(await client.closesWaitingOnOpen(to: Fixtures.transportID) == 0)
         mock.releaseHeldSends()
         try await opener.value
-        await closer.value
         #expect(await client.isConnected(to: Fixtures.transportID))
         #expect(mock.sentMessages(ofType: "CLOSE").isEmpty)
+    }
+
+    @Test func openRightAfterAWaitingCloseWritesItsOwnConnect() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let closer = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 1 }
+
+        mock.releaseHeldSends()
+        await closer.value
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        try await opener.value
+        let wire = mock.sentMessages.filter { $0.destinationID == Fixtures.transportID }.compactMap(\.type)
+        #expect(wire == ["CONNECT", "CLOSE", "CONNECT"])
+        #expect(await client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func closesIssuedBeforeALaterOpenDoNotUndoIt() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let firstClose = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 1 }
+        let secondClose = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 2 }
+        let laterOpen = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.virtualConnectionIntent(for: Fixtures.transportID) == 4 }
+
+        mock.releaseHeldSends()
+        try await opener.value
+        await firstClose.value
+        await secondClose.value
+        try await laterOpen.value
+        let wire = mock.sentMessages.filter { $0.destinationID == Fixtures.transportID }.compactMap(\.type)
+        #expect(wire == ["CONNECT"])
+        #expect(await client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func onlyTheLatestWaitingCloseIsSent() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let firstClose = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 1 }
+        let joiningOpen = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.virtualConnectionIntent(for: Fixtures.transportID) == 3 }
+        let lastClose = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 2 }
+
+        mock.releaseHeldSends()
+        try await opener.value
+        try await joiningOpen.value
+        await firstClose.value
+        await lastClose.value
+        let wire = mock.sentMessages.filter { $0.destinationID == Fixtures.transportID }.compactMap(\.type)
+        #expect(wire == ["CONNECT", "CLOSE"])
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func joinedOpenReopensAfterThePeerClosesMidOpen() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let joiner = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.virtualConnectionIntent(for: Fixtures.transportID) == 2 }
+        mock.push(["type": "CLOSE"], namespace: .connection, from: Fixtures.transportID)
+        try await eventually { await !client.isConnected(to: Fixtures.transportID) }
+
+        mock.releaseHeldSends()
+        try await opener.value
+        try await joiner.value
+        #expect(mock.sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 2)
+        #expect(await client.isConnected(to: Fixtures.transportID))
     }
 
     @Test func closeWaitingAcrossAReconnectLeavesTheReopenedConnection() async throws {
