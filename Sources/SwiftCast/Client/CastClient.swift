@@ -37,11 +37,14 @@ public actor CastClient {
 
     /// Tunable client behavior.
     public struct Configuration: Sendable {
-        /// Interval between heartbeat `PING`s. Must be shorter than ``inactivityTimeout``.
+        /// Interval between heartbeat `PING`s.
         public var heartbeatInterval: Duration = .seconds(5)
         /// The connection is considered dead when nothing at all arrives
         /// within this long of a `PING` being sent. Any inbound message, not
         /// only `PONG`, counts as a sign of life.
+        ///
+        /// A dead receiver is noticed within this long of the next `PING`, so
+        /// at most ``heartbeatInterval`` plus this long after its last message.
         public var inactivityTimeout: Duration = .seconds(10)
         /// Default time to wait for a response to a request, such as a
         /// platform receiver request or a request on a custom namespace.
@@ -131,10 +134,6 @@ public actor CastClient {
         configuration: Configuration = Configuration(),
         makeTransport: @escaping @Sendable () -> any CastTransport
     ) {
-        precondition(
-            configuration.heartbeatInterval < configuration.inactivityTimeout,
-            "heartbeatInterval must be shorter than inactivityTimeout"
-        )
         self.senderID = senderID
         self.configuration = configuration
         self.makeTransport = makeTransport
@@ -369,6 +368,7 @@ public actor CastClient {
             return try await inFlight.value
         }
         guard !connectedDestinations.contains(destination) else { return }
+        let generation = generation
         // Registered before the write so a message the peer sends as soon as
         // it sees CONNECT is not dropped as coming from an unknown peer.
         connectedDestinations.insert(destination)
@@ -376,18 +376,28 @@ public actor CastClient {
         let write = Task { try await sendJSON(payload, namespace: .connection, to: destination) }
         connectsInFlight[destination] = write
         defer {
-            if connectsInFlight[destination] == write { connectsInFlight[destination] = nil }
+            if self.generation == generation, connectsInFlight[destination] == write { connectsInFlight[destination] = nil }
         }
         do {
             try await write.value
         } catch {
-            connectedDestinations.remove(destination)
+            // After a reconnect the entry belongs to the new connection.
+            if self.generation == generation {
+                connectedDestinations.remove(destination)
+                protocolVersions[destination] = nil
+            }
             throw error
         }
     }
 
-    /// Closes the virtual connection to `destination`.
+    /// Closes the virtual connection to `destination`. If the connection is
+    /// still opening, this waits for the open to finish first.
     public func closeVirtualConnection(to destination: String) async {
+        if let inFlight = connectsInFlight[destination] {
+            let generation = generation
+            _ = try? await inFlight.value
+            guard self.generation == generation else { return }
+        }
         guard connectedDestinations.remove(destination) != nil else { return }
         protocolVersions[destination] = nil
         try? await sendJSON(Self.closePayload, namespace: .connection, to: destination)
@@ -485,7 +495,7 @@ public actor CastClient {
                 "version": .string(Self.version),
                 "browserVersion": .string(Self.version),
                 "platform": .number(Double(Self.senderPlatform)),
-                "systemVersion": .string(ProcessInfo.processInfo.operatingSystemVersionString),
+                "systemVersion": .string(Self.systemVersion),
                 "connectionType": 1,
             ],
         ]
@@ -497,8 +507,12 @@ public actor CastClient {
     }
 
     static var defaultUserAgent: String {
+        "SwiftCast/\(version) (\(osName) \(systemVersion))"
+    }
+
+    static var systemVersion: String {
         let os = ProcessInfo.processInfo.operatingSystemVersion
-        return "SwiftCast/\(version) (\(osName) \(os.majorVersion).\(os.minorVersion).\(os.patchVersion))"
+        return "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
     }
 
     private static var osName: String {
@@ -519,12 +533,16 @@ public actor CastClient {
         #endif
     }
 
-    /// The sender platform enum from chromium's cast channel code: 2 is iOS, 4 is macOS.
+    /// The `senderInfo.platform` value. Open screen's message_util.cc uses 2 for iOS,
+    /// 4 for macOS and 6 for linux; chromium sends 4 for every apple build and also
+    /// uses 6 for linux.
     static var senderPlatform: Int {
         #if os(iOS) || os(tvOS) || os(visionOS)
         2
         #elseif os(macOS)
         4
+        #elseif os(Linux)
+        6
         #else
         0
         #endif
@@ -604,13 +622,13 @@ public actor CastClient {
         case .heartbeat:
             if message.type == "PING" {
                 let generation = generation
-                Task { _ = await sendHeartbeat("PONG", to: message.sourceID, generation: generation) }
+                Task { await sendHeartbeat("PONG", to: message.sourceID, generation: generation) }
             }
             return
         case .connection:
             switch message.type {
             case "CONNECTED":
-                if let version = message.json?["protocolVersion"]?.intValue {
+                if connectedDestinations.contains(message.sourceID), let version = message.json?["protocolVersion"]?.intValue {
                     protocolVersions[message.sourceID] = version
                 }
             case "CLOSE":
@@ -637,9 +655,13 @@ public actor CastClient {
     }
 
     /// Whether an inbound message may be routed at all. Messages for other
-    /// senders, from peers without a virtual connection, or with a payload a
-    /// Google namespace cannot carry are dropped, as chromium's and open
-    /// screen's cast channel code do.
+    /// senders, or with a payload a Google namespace cannot carry, are dropped
+    /// as chromium's and open screen's cast channel code do. Messages from
+    /// peers without a virtual connection are dropped too, `*` broadcasts
+    /// included. That is stricter than open screen's
+    /// virtual_connection_router.cc, which still delivers broadcasts to every
+    /// endpoint, but no controller here needs a broadcast from a peer it has
+    /// not connected to.
     private func accepts(_ message: InboundMessage) -> Bool {
         let namespace = message.namespace
         guard message.destinationID == senderID || message.destinationID == CastEndpoint.broadcast else {
@@ -674,7 +696,10 @@ public actor CastClient {
 
     /// Sends a `PING` when one is due and enforces the inactivity deadline.
     /// Returns when the heartbeat loop should wake next, or `nil` to stop it.
-    private func heartbeatTick(generation: Int) async -> ContinuousClock.Instant? {
+    ///
+    /// The `PING` is written from its own task so a write that never
+    /// completes cannot hold up the deadline check.
+    private func heartbeatTick(generation: Int) -> ContinuousClock.Instant? {
         guard generation == self.generation, state == .connected else { return nil }
         let now = ContinuousClock.now
         if let inactivityDeadline, now >= inactivityDeadline {
@@ -686,7 +711,7 @@ public actor CastClient {
             if inactivityDeadline == nil {
                 inactivityDeadline = now + configuration.inactivityTimeout
             }
-            guard await sendHeartbeat("PING", to: CastEndpoint.platformReceiver, generation: generation) else { return nil }
+            Task { await sendHeartbeat("PING", to: CastEndpoint.platformReceiver, generation: generation) }
         }
         guard let inactivityDeadline else { return nextPing }
         return min(nextPing, inactivityDeadline)
@@ -694,14 +719,12 @@ public actor CastClient {
 
     /// A failed heartbeat write means the socket is unusable, so the client
     /// is torn down at once instead of waiting for the inactivity timeout.
-    private func sendHeartbeat(_ type: String, to destination: String, generation: Int) async -> Bool {
+    private func sendHeartbeat(_ type: String, to destination: String, generation: Int) async {
         do {
             try await sendJSON(["type": .string(type)], namespace: .heartbeat, to: destination)
-            return true
         } catch {
             let reason = if case .connectionFailed(let message)? = error as? CastError { message } else { error.localizedDescription }
             teardown(error: .connectionFailed("heartbeat write failed: \(reason)"), generation: generation)
-            return false
         }
     }
 
