@@ -36,12 +36,23 @@ public actor CastClient {
 
     /// Tunable client behavior.
     public struct Configuration: Sendable {
-        /// Interval between heartbeat `PING`s.
-        public var heartbeatInterval: Duration = .seconds(5)
-        /// The connection is considered dead after this long without any inbound traffic.
-        public var heartbeatTimeout: Duration = .seconds(16)
-        /// Default time to wait for a response to a request.
-        public var requestTimeout: Duration = .seconds(15)
+        /// Interval between heartbeat `PING`s. Non-positive values use the
+        /// default of 5 seconds.
+        public var heartbeatInterval: Duration = Self.defaultHeartbeatInterval
+        /// The connection is considered dead when nothing at all arrives
+        /// within this long of a `PING` being sent. Any inbound message, not
+        /// only `PONG`, counts as a sign of life.
+        ///
+        /// A dead receiver is noticed within this long of the next `PING`, so
+        /// at most ``heartbeatInterval`` plus this long after its last message.
+        /// Non-positive values use the default of 10 seconds.
+        public var inactivityTimeout: Duration = Self.defaultInactivityTimeout
+        /// Default time to wait for a response to a request, such as a
+        /// platform receiver request or a request on a custom namespace.
+        public var requestTimeout: Duration = .seconds(5)
+        /// Default time to wait for a response to a ``MediaController``
+        /// request. Loads use their own, longer timeout.
+        public var mediaRequestTimeout: Duration = .seconds(10)
         /// Sent in the `CONNECT` message. Defaults to
         /// `SwiftCast/<version> (<os name> <os version>)`.
         public var userAgent: String = CastClient.defaultUserAgent
@@ -50,6 +61,23 @@ public actor CastClient {
         public var applicationConnectionType: ConnectionType = .strong
 
         public init() {}
+
+        static let defaultHeartbeatInterval: Duration = .seconds(5)
+        static let defaultInactivityTimeout: Duration = .seconds(10)
+
+        var effectiveHeartbeatInterval: Duration {
+            heartbeatInterval > .zero ? heartbeatInterval : Self.defaultHeartbeatInterval
+        }
+
+        var effectiveInactivityTimeout: Duration {
+            inactivityTimeout > .zero ? inactivityTimeout : Self.defaultInactivityTimeout
+        }
+
+        @available(*, deprecated, renamed: "inactivityTimeout")
+        public var heartbeatTimeout: Duration {
+            get { inactivityTimeout }
+            set { inactivityTimeout = newValue }
+        }
     }
 
     /// The source ID used for messages sent by this client.
@@ -79,7 +107,8 @@ public actor CastClient {
     private var protocolVersions: [String: Int] = [:]
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
-    private var lastInbound = ContinuousClock.now
+    private var nextPing = ContinuousClock.now
+    private var inactivityDeadline: ContinuousClock.Instant?
 
     private let messageBroadcaster = Broadcaster<InboundMessage>()
     private let stateBroadcaster = Broadcaster<State>()
@@ -149,7 +178,7 @@ public actor CastClient {
             throw CastError.notConnected
         }
 
-        lastInbound = .now
+        inactivityDeadline = nil
         receiveTask = Task { [weak self] in
             do {
                 for try await chunk in transport.inbound {
@@ -463,7 +492,7 @@ public actor CastClient {
 
     private func ingest(_ chunk: Data, generation: Int) {
         guard generation == self.generation else { return }
-        lastInbound = .now
+        inactivityDeadline = nil
         let output = decoder.append(chunk)
         for message in output.messages {
             handle(InboundMessage(message))
@@ -478,7 +507,8 @@ public actor CastClient {
         switch message.namespace {
         case .heartbeat:
             if message.type == "PING" {
-                Task { try? await sendJSON(["type": "PONG"], namespace: .heartbeat, to: message.sourceID) }
+                let generation = generation
+                Task { await sendHeartbeat("PONG", to: message.sourceID, generation: generation) }
             }
             return
         case .connection:
@@ -514,26 +544,54 @@ public actor CastClient {
 
     private func startHeartbeat(generation: Int) {
         heartbeatTask?.cancel()
-        let interval = configuration.heartbeatInterval
-        let timeout = configuration.heartbeatTimeout
+        nextPing = .now + configuration.effectiveHeartbeatInterval
+        let firstWake = nextPing
         heartbeatTask = Task { [weak self] in
+            var wake = firstWake
             while !Task.isCancelled {
-                try? await Task.sleep(for: interval)
-                guard !Task.isCancelled, let self else { return }
-                guard await self.heartbeatTick(generation: generation, timeout: timeout) else { return }
+                try? await Task.sleep(until: wake, clock: .continuous)
+                guard !Task.isCancelled, let self, let next = await self.heartbeatTick(generation: generation) else { return }
+                wake = next
             }
         }
     }
 
-    /// Returns `false` when the heartbeat loop should stop.
-    private func heartbeatTick(generation: Int, timeout: Duration) async -> Bool {
-        guard generation == self.generation, state == .connected else { return false }
-        if ContinuousClock.now - lastInbound > timeout {
+    /// Sends a `PING` when one is due and enforces the inactivity deadline.
+    /// Returns when the heartbeat loop should wake next, or `nil` to stop it.
+    ///
+    /// The `PING` is written from its own task so a write that never
+    /// completes cannot hold up the deadline check.
+    private func heartbeatTick(generation: Int) -> ContinuousClock.Instant? {
+        guard generation == self.generation, state == .connected else { return nil }
+        let now = ContinuousClock.now
+        if let inactivityDeadline, now >= inactivityDeadline {
             teardown(error: .heartbeatTimeout, generation: generation)
-            return false
+            return nil
         }
-        try? await sendJSON(["type": "PING"], namespace: .heartbeat, to: CastEndpoint.platformReceiver)
-        return true
+        if now >= nextPing {
+            nextPing = now + configuration.effectiveHeartbeatInterval
+            if inactivityDeadline == nil {
+                inactivityDeadline = now + configuration.effectiveInactivityTimeout
+            }
+            Task { await sendHeartbeat("PING", to: CastEndpoint.platformReceiver, generation: generation) }
+        }
+        guard let inactivityDeadline else { return nextPing }
+        return min(nextPing, inactivityDeadline)
+    }
+
+    /// A failed heartbeat write means the socket is unusable, so the client
+    /// is torn down at once instead of waiting for the inactivity timeout.
+    ///
+    /// The send is dropped when the connection it was scheduled for has
+    /// already been replaced, so it never goes out on a newer transport.
+    private func sendHeartbeat(_ type: String, to destination: String, generation: Int) async {
+        guard generation == self.generation else { return }
+        do {
+            try await sendJSON(["type": .string(type)], namespace: .heartbeat, to: destination)
+        } catch {
+            let reason = if case .connectionFailed(let message)? = error as? CastError { message } else { error.localizedDescription }
+            teardown(error: .connectionFailed("heartbeat write failed: \(reason)"), generation: generation)
+        }
     }
 
     private func teardown(error: CastError?, generation: Int) {

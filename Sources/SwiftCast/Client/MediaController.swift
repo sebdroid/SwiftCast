@@ -277,6 +277,7 @@ public actor MediaController {
 
     private func send(_ payload: some Encodable & Sendable, timeout: Duration?) async throws -> InboundMessage {
         guard !isClosed else { throw CastError.sessionClosed }
+        let timeout = timeout ?? client.configuration.mediaRequestTimeout
         return try await client.request(payload, namespace: .media, to: application.transportId, timeout: timeout)
     }
 

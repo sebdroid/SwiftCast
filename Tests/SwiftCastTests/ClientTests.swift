@@ -98,7 +98,7 @@ struct ClientTests {
         mock.answersPings = false
         let client = makeClient(mock) {
             $0.heartbeatInterval = .milliseconds(50)
-            $0.heartbeatTimeout = .milliseconds(300)
+            $0.inactivityTimeout = .milliseconds(300)
         }
         try await client.connect()
         let states = await client.stateUpdates()
@@ -115,12 +115,206 @@ struct ClientTests {
         let mock = MockReceiver()
         let client = makeClient(mock) {
             $0.heartbeatInterval = .milliseconds(30)
-            $0.heartbeatTimeout = .milliseconds(200)
+            $0.inactivityTimeout = .milliseconds(100)
         }
         try await client.connect()
         try await Task.sleep(for: .milliseconds(600))
         #expect(await client.state == .connected)
         #expect(mock.sentMessages(ofType: "PING").count >= 5)
+    }
+
+    @Test func deadConnectionIsDetectedWithinIntervalPlusTimeoutOfLastInbound() async throws {
+        let mock = MockReceiver()
+        mock.answersPings = false
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(200)
+            $0.inactivityTimeout = .milliseconds(400)
+        }
+        try await client.connect()
+        // The first PING arms the deadline; inbound traffic right after it
+        // clears it, so the next PING arms a fresh one.
+        try await eventually { mock.sentMessages(ofType: "PING").count >= 1 }
+        mock.push(Fixtures.receiverStatus(level: 0.3), namespace: .receiver, to: "*")
+        try await eventually { await client.receiverStatus?.volume?.level == 0.3 }
+        let lastInbound = ContinuousClock.now
+        try await eventually(timeout: .seconds(5)) { await client.state != .connected }
+        let elapsed = ContinuousClock.now - lastInbound
+        #expect(await client.state == .closed(.heartbeatTimeout))
+        #expect(elapsed < .milliseconds(1100))
+    }
+
+    @Test func intervalLongerThanTimeoutStillDetectsSilence() async throws {
+        let answering = MockReceiver()
+        let silent = MockReceiver()
+        silent.answersPings = false
+        let configure: (inout CastClient.Configuration) -> Void = {
+            $0.heartbeatInterval = .milliseconds(300)
+            $0.inactivityTimeout = .milliseconds(100)
+        }
+        let healthy = makeClient(answering, configure: configure)
+        let dead = makeClient(silent, configure: configure)
+        try await healthy.connect()
+        try await dead.connect()
+
+        try await eventually { await dead.state != .connected }
+        #expect(await dead.state == .closed(.heartbeatTimeout))
+        try await eventually { answering.sentMessages(ofType: "PING").count >= 3 }
+        #expect(await healthy.state == .connected)
+    }
+
+    @Test func stalledPingWriteStillTimesOut() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(50)
+            $0.inactivityTimeout = .milliseconds(200)
+        }
+        try await client.connect()
+        try await eventually { await client.state != .connected }
+        #expect(await client.state == .closed(.heartbeatTimeout))
+        #expect(mock.sentMessages(ofType: "PING").count >= 1)
+    }
+
+    @Test func anyInboundTrafficKeepsConnectionAlive() async throws {
+        let mock = MockReceiver()
+        mock.answersPings = false
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(50)
+            $0.inactivityTimeout = .milliseconds(200)
+        }
+        try await client.connect()
+        for step in 1...16 {
+            mock.push(Fixtures.receiverStatus(level: Double(step) / 100), namespace: .receiver, to: "*")
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(await client.state == .connected)
+        #expect(mock.sentMessages(ofType: "PING").count >= 5)
+        #expect(mock.sentMessages(ofType: "PONG").isEmpty)
+    }
+
+    @Test func failedPingWriteTearsDownPromptly() async throws {
+        let mock = MockReceiver()
+        mock.failSends(ofType: "PING", with: .connectionFailed("broken pipe"))
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(50)
+            $0.inactivityTimeout = .seconds(30)
+        }
+        let start = ContinuousClock.now
+        try await client.connect()
+        try await eventually { await client.state != .connected }
+        #expect(ContinuousClock.now - start < .seconds(2))
+        #expect(await client.state == .closed(.connectionFailed("heartbeat write failed: broken pipe")))
+        #expect(mock.sentMessages(ofType: "PING").count >= 1)
+    }
+
+    @Test func failedPongWriteTearsDown() async throws {
+        let mock = MockReceiver()
+        mock.failSends(ofType: "PONG", with: .connectionFailed("broken pipe"))
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.push(["type": "PING"], namespace: .heartbeat)
+        try await eventually { await client.state != .connected }
+        #expect(await client.state == .closed(.connectionFailed("heartbeat write failed: broken pipe")))
+    }
+
+    @Test func lateHeartbeatWriteFailureLeavesReconnectedClientAlone() async throws {
+        let first = MockReceiver()
+        first.holdSends(ofType: "PING")
+        first.failsHeldSendsOnClose = false
+        let mocks = [first, MockReceiver()]
+        let index = Counter()
+        var configuration = CastClient.Configuration()
+        configuration.heartbeatInterval = .milliseconds(50)
+        configuration.inactivityTimeout = .milliseconds(150)
+        let client = CastClient(configuration: configuration) { mocks[index.increment() - 1] }
+
+        try await client.connect()
+        try await eventually { await client.state != .connected }
+        #expect(await client.state == .closed(.heartbeatTimeout))
+        try await eventually { first.heldSendCount >= 1 }
+
+        try await client.connect()
+        let states = await client.stateUpdates()
+        first.releaseHeldSends()
+        try await eventually { mocks[1].sentMessages(ofType: "PING").count >= 3 }
+        #expect(await client.state == .connected)
+        #expect(mocks[1].isOpen)
+
+        await client.disconnect()
+        var seen: [CastClient.State] = []
+        for await state in states {
+            seen.append(state)
+            if case .closed = state { break }
+        }
+        #expect(seen == [.connected, .closed(nil)])
+    }
+
+    @Test func inactivityCloseWakesAtTheDeadlineNotTheNextTick() async throws {
+        let mock = MockReceiver()
+        mock.answersPings = false
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(600)
+            $0.inactivityTimeout = .milliseconds(700)
+        }
+        try await client.connect()
+        let start = ContinuousClock.now
+        try await eventually { await client.state != .connected }
+        let elapsed = ContinuousClock.now - start
+        #expect(await client.state == .closed(.heartbeatTimeout))
+        // The first PING at 600 ms arms a deadline at 1300 ms; the tick after
+        // that deadline would be at 1800 ms.
+        #expect(elapsed < .milliseconds(1700))
+    }
+
+    @Test func nonPositiveIntervalUsesTheDefaultCadence() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock) { $0.heartbeatInterval = .zero }
+        try await client.connect()
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(mock.sentMessages(ofType: "PING").count <= 1)
+        #expect(await client.state == .connected)
+    }
+
+    @Test func nonPositiveTimeoutUsesTheDefault() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(30)
+            $0.inactivityTimeout = .zero
+        }
+        try await client.connect()
+        try await eventually { mock.sentMessages(ofType: "PING").count >= 5 }
+        #expect(await client.state == .connected)
+    }
+
+    @Test func defaultTimeouts() {
+        let configuration = CastClient.Configuration()
+        #expect(configuration.heartbeatInterval == .seconds(5))
+        #expect(configuration.inactivityTimeout == .seconds(10))
+        #expect(configuration.requestTimeout == .seconds(5))
+        #expect(configuration.mediaRequestTimeout == .seconds(10))
+    }
+
+    @Test func receiverAndMediaRequestsUseTheirOwnTimeouts() async throws {
+        let mock = MockReceiver() // never replies to requests
+        let client = makeClient(mock) {
+            $0.requestTimeout = .milliseconds(100)
+            $0.mediaRequestTimeout = .milliseconds(600)
+        }
+        try await client.connect()
+
+        var start = ContinuousClock.now
+        await #expect(throws: CastError.timeout) { try await client.receiver.getStatus() }
+        let receiverElapsed = ContinuousClock.now - start
+        #expect(receiverElapsed >= .milliseconds(100))
+        #expect(receiverElapsed < .milliseconds(500))
+
+        let application = try Fixtures.mediaApp.decode(CastApplication.self)
+        let media = try await client.mediaController(for: application)
+        start = ContinuousClock.now
+        await #expect(throws: CastError.timeout) { try await media.refreshStatus() }
+        let mediaElapsed = ContinuousClock.now - start
+        #expect(mediaElapsed >= .milliseconds(600))
+        #expect(mediaElapsed < .seconds(3))
     }
 
     @Test func connectionLossFailsPendingRequests() async throws {
@@ -442,6 +636,61 @@ struct ClientTests {
         let result = try await client.receiver.availability(of: [.defaultMediaReceiver, .jellyfin])
         #expect(result[.defaultMediaReceiver] == .available)
         #expect(result[.jellyfin] == .unavailable)
+    }
+}
+
+@Suite("MockReceiver", .timeLimit(.minutes(1)))
+struct MockReceiverTests {
+    func ping() throws -> Data {
+        let message = CastMessage(sourceID: "sender-0", destinationID: "receiver-0", namespace: CastNamespace.heartbeat.rawValue, payload: .string(#"{"type":"PING"}"#))
+        return try FrameCodec.frame(message)
+    }
+
+    func heldPing(on mock: MockReceiver) async throws -> Task<Void, any Error> {
+        let frame = try ping()
+        let send = Task { try await mock.send(frame) }
+        try await eventually { mock.heldSendCount == 1 }
+        return send
+    }
+
+    @Test func closeFailsHeldSendsByDefault() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let send = try await heldPing(on: mock)
+        mock.close()
+        await #expect(throws: MockReceiver.cancelledSendError) { try await send.value }
+    }
+
+    @Test func heldSendReleasedBeforeCloseSucceeds() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let send = try await heldPing(on: mock)
+        mock.releaseHeldSends()
+        try await send.value
+        mock.close()
+    }
+
+    @Test func heldSendReleasedAfterCloseFails() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let send = try await heldPing(on: mock)
+        mock.failsHeldSendsOnClose = false
+        mock.close()
+        mock.releaseHeldSends()
+        await #expect(throws: MockReceiver.cancelledSendError) { try await send.value }
+    }
+
+    @Test func answersPingsCanChangeAfterOpen() async throws {
+        let mock = MockReceiver()
+        try await mock.open()
+        mock.answersPings = false
+        try await mock.send(ping())
+        mock.answersPings = true
+        try await mock.send(ping())
+        mock.drop()
+        var replies = 0
+        for try await _ in mock.inbound { replies += 1 }
+        #expect(replies == 1)
     }
 }
 
