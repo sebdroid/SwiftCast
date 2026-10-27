@@ -199,12 +199,15 @@ struct ClientTests {
         #expect(senderInfo["sdkType"] == 2)
         #expect(senderInfo["version"] == .string(CastClient.version))
         #expect(senderInfo["browserVersion"] == .string(CastClient.version))
-        #expect(senderInfo["systemVersion"] == .string(ProcessInfo.processInfo.operatingSystemVersionString))
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        #expect(senderInfo["systemVersion"] == .string("\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"))
         #expect(senderInfo["connectionType"] == 1)
         #if os(iOS) || os(tvOS) || os(visionOS)
         #expect(senderInfo["platform"] == 2)
         #elseif os(macOS)
         #expect(senderInfo["platform"] == 4)
+        #elseif os(Linux)
+        #expect(senderInfo["platform"] == 6)
         #else
         #expect(senderInfo["platform"] == 0)
         #endif
@@ -249,6 +252,29 @@ struct ClientTests {
         #expect(await client.state == .connected)
 
         await client.closeVirtualConnection(to: Fixtures.transportID)
+        #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == nil)
+    }
+
+    @Test func connectedFromUnknownSourceIsIgnored() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.push(["type": "CONNECTED", "protocolVersion": 1], namespace: .connection, from: "web-unknown")
+        mock.push(Fixtures.receiverStatus(level: 0.3), namespace: .receiver, to: "*")
+        try await eventually { await client.receiverStatus?.volume?.level == 0.3 }
+        #expect(await client.negotiatedProtocolVersion(for: "web-unknown") == nil)
+        #expect(await !client.isConnected(to: "web-unknown"))
+    }
+
+    @Test func connectedAfterCloseIsIgnored() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        await client.closeVirtualConnection(to: Fixtures.transportID)
+        mock.push(["type": "CONNECTED", "protocolVersion": 1], namespace: .connection, from: Fixtures.transportID)
+        mock.push(Fixtures.receiverStatus(level: 0.3), namespace: .receiver, to: "*")
+        try await eventually { await client.receiverStatus?.volume?.level == 0.3 }
         #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == nil)
     }
 
