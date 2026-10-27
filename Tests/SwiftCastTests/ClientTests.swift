@@ -255,17 +255,17 @@ struct ClientTests {
         let mock = MockReceiver()
         mock.answersPings = false
         let client = makeClient(mock) {
-            $0.heartbeatInterval = .milliseconds(400)
-            $0.inactivityTimeout = .milliseconds(500)
+            $0.heartbeatInterval = .milliseconds(600)
+            $0.inactivityTimeout = .milliseconds(700)
         }
         try await client.connect()
         let start = ContinuousClock.now
         try await eventually { await client.state != .connected }
         let elapsed = ContinuousClock.now - start
         #expect(await client.state == .closed(.heartbeatTimeout))
-        // The first PING at 400 ms arms a deadline at 900 ms; the tick after
-        // that deadline would be at 1200 ms.
-        #expect(elapsed < .milliseconds(1100))
+        // The first PING at 600 ms arms a deadline at 1300 ms; the tick after
+        // that deadline would be at 1800 ms.
+        #expect(elapsed < .milliseconds(1700))
     }
 
     @Test func nonPositiveIntervalUsesTheDefaultCadence() async throws {
@@ -1339,13 +1339,148 @@ struct ClientTests {
         let closer = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
         try await eventually { await client.closesAwaitingOpen == 1 }
 
+        try await eventually { await client.closesWaitingOnOpen(to: Fixtures.transportID) == 1 }
         closer.cancel()
-        try await eventually { await client.closesAwaitingOpen == 0 }
+        await closer.value
+        #expect(await client.closesAwaitingOpen == 0)
+        #expect(await client.closesWaitingOnOpen(to: Fixtures.transportID) == 0)
         mock.releaseHeldSends()
         try await opener.value
-        await closer.value
         #expect(await client.isConnected(to: Fixtures.transportID))
         #expect(mock.sentMessages(ofType: "CLOSE").isEmpty)
+    }
+
+    @Test func cancelledLaterCloseLeavesTheEarlierCloseInCharge() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let firstClose = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesWaitingOnOpen(to: Fixtures.transportID) == 1 }
+        let cancelledClose = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesWaitingOnOpen(to: Fixtures.transportID) == 2 }
+
+        cancelledClose.cancel()
+        await cancelledClose.value
+        #expect(await client.virtualConnectionIntent(for: Fixtures.transportID) == 2)
+        mock.releaseHeldSends()
+        try await opener.value
+        await firstClose.value
+        let wire = mock.sentMessages.filter { $0.destinationID == Fixtures.transportID }.compactMap(\.type)
+        #expect(wire == ["CONNECT", "CLOSE"])
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func closeCancelledBeforeItStartsLeavesTheEarlierCloseInCharge() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let firstClose = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesWaitingOnOpen(to: Fixtures.transportID) == 1 }
+
+        let cancelledClose = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            await client.closeVirtualConnection(to: Fixtures.transportID)
+        }
+        await cancelledClose.value
+        #expect(await client.virtualConnectionIntent(for: Fixtures.transportID) == 2)
+        mock.releaseHeldSends()
+        try await opener.value
+        await firstClose.value
+        let wire = mock.sentMessages.filter { $0.destinationID == Fixtures.transportID }.compactMap(\.type)
+        #expect(wire == ["CONNECT", "CLOSE"])
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func openRightAfterAWaitingCloseWritesItsOwnConnect() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let closer = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 1 }
+
+        mock.releaseHeldSends()
+        await closer.value
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        try await opener.value
+        let wire = mock.sentMessages.filter { $0.destinationID == Fixtures.transportID }.compactMap(\.type)
+        #expect(wire == ["CONNECT", "CLOSE", "CONNECT"])
+        #expect(await client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func closesIssuedBeforeALaterOpenDoNotUndoIt() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let firstClose = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 1 }
+        let secondClose = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 2 }
+        let laterOpen = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.virtualConnectionIntent(for: Fixtures.transportID) == 4 }
+
+        mock.releaseHeldSends()
+        try await opener.value
+        await firstClose.value
+        await secondClose.value
+        try await laterOpen.value
+        let wire = mock.sentMessages.filter { $0.destinationID == Fixtures.transportID }.compactMap(\.type)
+        #expect(wire == ["CONNECT"])
+        #expect(await client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func onlyTheLatestWaitingCloseIsSent() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let firstClose = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 1 }
+        let joiningOpen = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.virtualConnectionIntent(for: Fixtures.transportID) == 3 }
+        let lastClose = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 2 }
+
+        mock.releaseHeldSends()
+        try await opener.value
+        try await joiningOpen.value
+        await firstClose.value
+        await lastClose.value
+        let wire = mock.sentMessages.filter { $0.destinationID == Fixtures.transportID }.compactMap(\.type)
+        #expect(wire == ["CONNECT", "CLOSE"])
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func joinedOpenReopensAfterThePeerClosesMidOpen() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let joiner = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.virtualConnectionIntent(for: Fixtures.transportID) == 2 }
+        mock.push(["type": "CLOSE"], namespace: .connection, from: Fixtures.transportID)
+        try await eventually { await !client.isConnected(to: Fixtures.transportID) }
+
+        mock.releaseHeldSends()
+        try await opener.value
+        try await joiner.value
+        #expect(mock.sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 2)
+        #expect(await client.isConnected(to: Fixtures.transportID))
     }
 
     @Test func closeWaitingAcrossAReconnectLeavesTheReopenedConnection() async throws {
@@ -1429,6 +1564,61 @@ struct ClientTests {
         let result = try await client.receiver.availability(of: [.defaultMediaReceiver, .jellyfin])
         #expect(result[.defaultMediaReceiver] == .available)
         #expect(result[.jellyfin] == .unavailable)
+    }
+}
+
+@Suite("MockReceiver", .timeLimit(.minutes(1)))
+struct MockReceiverTests {
+    func ping() throws -> Data {
+        let message = CastMessage(sourceID: "sender-0", destinationID: "receiver-0", namespace: CastNamespace.heartbeat.rawValue, payload: .string(#"{"type":"PING"}"#))
+        return try FrameCodec.frame(message)
+    }
+
+    func heldPing(on mock: MockReceiver) async throws -> Task<Void, any Error> {
+        let frame = try ping()
+        let send = Task { try await mock.send(frame) }
+        try await eventually { mock.sentMessages(ofType: "PING").count == 1 }
+        return send
+    }
+
+    @Test func closeFailsHeldSendsByDefault() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let send = try await heldPing(on: mock)
+        mock.close()
+        await #expect(throws: MockReceiver.cancelledSendError) { try await send.value }
+    }
+
+    @Test func heldSendReleasedBeforeCloseSucceeds() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let send = try await heldPing(on: mock)
+        mock.releaseHeldSends()
+        try await send.value
+        mock.close()
+    }
+
+    @Test func heldSendReleasedAfterCloseFails() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let send = try await heldPing(on: mock)
+        mock.failsHeldSendsOnClose = false
+        mock.close()
+        mock.releaseHeldSends()
+        await #expect(throws: MockReceiver.cancelledSendError) { try await send.value }
+    }
+
+    @Test func answersPingsCanChangeAfterOpen() async throws {
+        let mock = MockReceiver()
+        try await mock.open()
+        mock.answersPings = false
+        try await mock.send(ping())
+        mock.answersPings = true
+        try await mock.send(ping())
+        mock.drop()
+        var replies = 0
+        for try await _ in mock.inbound { replies += 1 }
+        #expect(replies == 1)
     }
 }
 

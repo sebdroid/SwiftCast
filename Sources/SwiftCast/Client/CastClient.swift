@@ -112,6 +112,11 @@ public actor CastClient {
         var waiters: [Int: (@Sendable (String) -> Void)?]
     }
 
+    private struct OpenInFlight {
+        let write: Task<Void, any Error>
+        let completion: OpenCompletion
+    }
+
     private struct PendingRequest {
         let continuation: CheckedContinuation<InboundMessage, any Error>
         let timeoutTask: Task<Void, Never>
@@ -142,7 +147,8 @@ public actor CastClient {
     private var pending: [PendingKey: PendingRequest] = [:]
     private var nextRequestID = 1
     private var connectedDestinations: Set<String> = []
-    private var connectsInFlight: [String: Task<Void, any Error>] = [:]
+    private var connectsInFlight: [String: OpenInFlight] = [:]
+    private var virtualConnectionIntents: [String: Int] = [:]
     private(set) var closesAwaitingOpen = 0
     private var launchInFlight: LaunchInFlight?
     private var nextLaunchID = 0
@@ -397,10 +403,17 @@ public actor CastClient {
 
     /// Opens a virtual connection to `destination` (e.g. an app's `transportId`).
     /// Does nothing if one is already open. A call made while another is still
-    /// opening the same connection waits for it and shares its result.
+    /// opening the same connection waits for it and shares its result, then
+    /// opens again if the connection was closed before it resumed and no later
+    /// open or close has been issued.
     public func openVirtualConnection(to destination: String) async throws {
-        if let inFlight = connectsInFlight[destination] {
-            return try await inFlight.value
+        let intent = recordIntent(for: destination)
+        for _ in 0..<2 {
+            guard let inFlight = connectsInFlight[destination] else { break }
+            let generation = generation
+            try await inFlight.write.value
+            guard self.generation == generation, virtualConnectionIntents[destination] == intent,
+                  !connectedDestinations.contains(destination) else { return }
         }
         guard !connectedDestinations.contains(destination) else { return }
         let generation = generation
@@ -408,45 +421,79 @@ public actor CastClient {
         // it sees CONNECT is not dropped as coming from an unknown peer.
         connectedDestinations.insert(destination)
         let payload = connectPayload(to: destination)
-        let write = Task { try await sendJSON(payload, namespace: .connection, to: destination) }
-        connectsInFlight[destination] = write
-        defer {
-            if self.generation == generation, connectsInFlight[destination] == write { connectsInFlight[destination] = nil }
-        }
-        do {
-            try await write.value
-        } catch {
-            // After a reconnect the entry belongs to the new connection.
-            if self.generation == generation {
-                connectedDestinations.remove(destination)
-                protocolVersions[destination] = nil
+        let completion = OpenCompletion()
+        let write = Task {
+            let result: Result<Void, any Error>
+            do {
+                try await sendJSON(payload, namespace: .connection, to: destination)
+                result = .success(())
+            } catch {
+                result = .failure(error)
             }
-            throw error
+            // Settled here, before any waiter resumes, so nothing can observe
+            // a finished open that is still listed as in flight. After a
+            // reconnect the entries belong to the new connection.
+            if self.generation == generation {
+                if connectsInFlight[destination]?.completion === completion { connectsInFlight[destination] = nil }
+                if case .failure = result {
+                    connectedDestinations.remove(destination)
+                    protocolVersions[destination] = nil
+                }
+            }
+            completion.finish(result)
+            try result.get()
         }
+        connectsInFlight[destination] = OpenInFlight(write: write, completion: completion)
+        try await write.value
     }
 
     /// Closes the virtual connection to `destination`.
     ///
     /// A close issued while the connection is still opening takes effect
     /// only after that open completes, so the wire order is always `CONNECT`
-    /// then `CLOSE`. If that open fails there is nothing to close. A close
-    /// cancelled while it waits returns at once and changes nothing: the
-    /// connection stays as the open leaves it.
+    /// then `CLOSE`. If that open fails, or another open or close of the same
+    /// destination is issued while it waits, it does nothing: the later call
+    /// decides the outcome. A close cancelled while it waits returns at once
+    /// and changes nothing: the connection stays as the open leaves it, and
+    /// it does not count as a later call for closes that are still waiting.
     public func closeVirtualConnection(to destination: String) async {
+        let intent = recordIntent(for: destination)
         if let inFlight = connectsInFlight[destination] {
             let generation = generation
             closesAwaitingOpen += 1
             defer { closesAwaitingOpen -= 1 }
             do {
-                try await awaitingCancellation(of: inFlight)
+                try await inFlight.completion.wait()
             } catch {
+                // A cancelled close decides nothing, so it must not supersede
+                // an earlier close still waiting. Only the latest call can be
+                // undone, so a later call keeps superseding as before.
+                if error is CancellationError, virtualConnectionIntents[destination] == intent {
+                    virtualConnectionIntents[destination] = intent - 1
+                }
                 return
             }
-            guard self.generation == generation else { return }
+            guard self.generation == generation, virtualConnectionIntents[destination] == intent else { return }
         }
         guard connectedDestinations.remove(destination) != nil else { return }
         protocolVersions[destination] = nil
         try? await sendJSON(Self.closePayload, namespace: .connection, to: destination)
+    }
+
+    private func recordIntent(for destination: String) -> Int {
+        let intent = virtualConnectionIntents[destination, default: 0] + 1
+        virtualConnectionIntents[destination] = intent
+        return intent
+    }
+
+    /// How many open and close calls have been issued for `destination`.
+    func virtualConnectionIntent(for destination: String) -> Int {
+        virtualConnectionIntents[destination, default: 0]
+    }
+
+    /// How many closes are suspended on the in-flight open of `destination`.
+    func closesWaitingOnOpen(to destination: String) -> Int {
+        connectsInFlight[destination]?.completion.waiterCount ?? 0
     }
 
     /// Whether a virtual connection to `destination` is currently open.
@@ -928,5 +975,56 @@ private func awaitingCancellation<Success: Sendable>(of task: Task<Success, any 
             guard case .suspended(let continuation) = state else { return nil }
             return continuation
         }?.resume(throwing: CancellationError())
+    }
+}
+
+/// Lets closes wait for an in-flight open without owning its write.
+/// `Task.value` ignores the waiter's cancellation, so a cancelled waiter is
+/// resumed and dropped here at once instead of lingering until the write ends.
+private final class OpenCompletion: Sendable {
+    private struct State: Sendable {
+        var result: Result<Void, any Error>?
+        var waiters: [Int: CheckedContinuation<Void, any Error>] = [:]
+        var cancelled: Set<Int> = []
+        var nextID = 0
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    var waiterCount: Int { state.withLock { $0.waiters.count } }
+
+    func finish(_ result: Result<Void, any Error>) {
+        let waiters = state.withLock { state in
+            state.result = result
+            defer { state.waiters = [:] }
+            return Array(state.waiters.values)
+        }
+        for waiter in waiters { waiter.resume(with: result) }
+    }
+
+    func wait() async throws {
+        let id = state.withLock { state in
+            defer { state.nextID += 1 }
+            return state.nextID
+        }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                let ready = state.withLock { state -> Result<Void, any Error>? in
+                    if state.cancelled.remove(id) != nil { return .failure(CancellationError()) }
+                    if let result = state.result { return result }
+                    state.waiters[id] = continuation
+                    return nil
+                }
+                if let ready { continuation.resume(with: ready) }
+            }
+        } onCancel: {
+            // Each continuation is taken out under the lock exactly once, by
+            // either this handler or `finish`, so it is never resumed twice.
+            state.withLock { state -> CheckedContinuation<Void, any Error>? in
+                if let waiter = state.waiters.removeValue(forKey: id) { return waiter }
+                state.cancelled.insert(id)
+                return nil
+            }?.resume(throwing: CancellationError())
+        }
     }
 }
