@@ -22,6 +22,144 @@ struct ClientTests {
         #expect(await client.isConnected(to: "receiver-0"))
     }
 
+    @Test func observationStreamsEndOnceTheConnectionCloses() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let states = await client.stateUpdates()
+        let statuses = await client.receiverStatusUpdates()
+        mock.push(Fixtures.receiverStatus(level: 0.25), namespace: .receiver, to: "*")
+        try await eventually { await client.receiverStatus != nil }
+        #expect(await client.observationSubscriberCount == 2)
+
+        mock.drop(with: CastError.connectionFailed("reset"))
+        var seen: [CastClient.State] = []
+        for await state in states { seen.append(state) }
+        #expect(seen == [.connected, .closed(.connectionFailed("reset"))])
+        var levels: [Double?] = []
+        for await status in statuses { levels.append(status.volume?.level) }
+        #expect(levels == [0.25])
+        #expect(await client.observationSubscriberCount == 0)
+    }
+
+    @Test func observationStreamsEndWhenConnectFails() async throws {
+        let mock = MockReceiver()
+        mock.failOpen(with: .connectionFailed("refused"))
+        let client = makeClient(mock)
+        let states = await client.stateUpdates()
+        await #expect(throws: CastError.self) { try await client.connect() }
+        var seen: [CastClient.State] = []
+        for await state in states { seen.append(state) }
+        #expect(seen == [.disconnected, .connecting, .closed(.connectionFailed("refused"))])
+        #expect(await client.observationSubscriberCount == 0)
+    }
+
+    @Test func observationConsumersReturnOnceTheClientCloses() async throws {
+        let mock = MockReceiver()
+        Fixtures.installDefaultReceiver(on: mock)
+        let client = makeClient(mock)
+        try await client.connect()
+        _ = try await client.receiver.getStatus()
+        let (started, starting) = AsyncStream<Void>.makeStream()
+        let finished = OSAllocatedUnfairLock(initialState: 0)
+        let states = await client.stateUpdates()
+        let statuses = await client.receiverStatusUpdates()
+        let stateConsumer = Task {
+            var seen: [CastClient.State] = []
+            for await state in states {
+                seen.append(state)
+                if seen.count == 1 { starting.yield() }
+            }
+            finished.withLock { $0 += 1 }
+            return seen
+        }
+        let statusConsumer = Task {
+            var count = 0
+            for await _ in statuses {
+                count += 1
+                if count == 1 { starting.yield() }
+            }
+            finished.withLock { $0 += 1 }
+            return count
+        }
+        var iterator = started.makeAsyncIterator()
+        _ = await iterator.next()
+        _ = await iterator.next()
+
+        await client.disconnect()
+        // Bounded, so a consumer that never returns fails the test instead of hanging it.
+        try await eventually { finished.withLock { $0 } == 2 }
+        try #require(finished.withLock { $0 } == 2)
+        #expect(await stateConsumer.value == [.connected, .closed(nil)])
+        #expect(await statusConsumer.value == 1)
+        #expect(await client.observationSubscriberCount == 0)
+    }
+
+    @Test func stateUpdatesMadeWhileClosedEndAfterTheClosedState() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.drop(with: CastError.connectionFailed("reset"))
+        try await eventually { await client.state == .closed(.connectionFailed("reset")) }
+
+        var seen: [CastClient.State] = []
+        for await state in await client.stateUpdates() { seen.append(state) }
+        #expect(seen == [.closed(.connectionFailed("reset"))])
+        #expect(await client.observationSubscriberCount == 0)
+    }
+
+    @Test func receiverStatusUpdatesMadeWhileClosedEndAfterTheCachedStatus() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.push(Fixtures.receiverStatus(level: 0.25), namespace: .receiver, to: "*")
+        try await eventually { await client.receiverStatus != nil }
+        await client.disconnect()
+
+        var levels: [Double?] = []
+        for await status in await client.receiverStatusUpdates() { levels.append(status.volume?.level) }
+        #expect(levels == [0.25])
+        #expect(await client.observationSubscriberCount == 0)
+
+        let fresh = MockReceiver()
+        fresh.failOpen(with: .connectionFailed("refused"))
+        let neverConnected = makeClient(fresh)
+        await #expect(throws: CastError.self) { try await neverConnected.connect() }
+        var count = 0
+        for await _ in await neverConnected.receiverStatusUpdates() { count += 1 }
+        #expect(count == 0)
+    }
+
+    @Test func messagesMadeWhileClosedEndUntilTheNextConnect() async throws {
+        let first = MockReceiver()
+        let second = MockReceiver()
+        let attempts = Counter()
+        let client = CastClient { attempts.increment() == 1 ? first : second }
+        try await client.connect()
+        await client.disconnect()
+
+        var all = 0
+        for await _ in client.messages() { all += 1 }
+        var filtered = 0
+        for await _ in client.messages(in: .receiver) { filtered += 1 }
+        #expect(all == 0)
+        #expect(filtered == 0)
+
+        try await client.connect()
+        var messages = client.messages(in: .receiver).makeAsyncIterator()
+        var states = await client.stateUpdates().makeAsyncIterator()
+        let current = await states.next()
+        #expect(current == .connected)
+        second.push(Fixtures.receiverStatus(level: 0.75), namespace: .receiver, to: "*")
+        let message = await messages.next()
+        #expect(message?.type == "RECEIVER_STATUS")
+        await client.disconnect()
+        let closed = await states.next()
+        let end = await states.next()
+        #expect(closed == .closed(nil))
+        #expect(end == nil)
+    }
+
     @Test func connectFailurePropagatesAndAllowsRetry() async throws {
         let failing = MockReceiver()
         failing.failOpen(with: .connectionFailed("refused"))
@@ -1823,13 +1961,17 @@ struct MockReceiverTests {
 }
 
 /// Polls `condition` until it holds or the deadline passes.
-func eventually(timeout: Duration = .seconds(5), _ condition: @Sendable () async -> Bool) async throws {
+func eventually(
+    timeout: Duration = .seconds(5),
+    sourceLocation: SourceLocation = #_sourceLocation,
+    _ condition: @Sendable () async -> Bool
+) async throws {
     let deadline = ContinuousClock.now + timeout
     while ContinuousClock.now < deadline {
         if await condition() { return }
         try await Task.sleep(for: .milliseconds(10))
     }
-    Issue.record("Condition not met within \(timeout)")
+    Issue.record("Condition not met within \(timeout)", sourceLocation: sourceLocation)
 }
 
 final class Counter: @unchecked Sendable {
