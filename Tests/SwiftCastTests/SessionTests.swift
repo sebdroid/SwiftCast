@@ -481,6 +481,84 @@ struct SessionTests {
         #expect(attempts.count == 2)
     }
 
+    @Test func sessionDroppedDuringAReconnectIsFreedAndConnectsNoMore() async throws {
+        let first = MockReceiver()
+        Fixtures.installDefaultReceiver(on: first)
+        let second = MockReceiver()
+        Fixtures.installDefaultReceiver(on: second)
+        second.holdSends(ofType: "GET_STATUS")
+        let log = ClientLog([first, second])
+        let interval = Duration.milliseconds(20)
+        var session: CastSession? = CastSession { log.makeClient($0) }
+        weak var weakSession = session
+        session?.reconnectPolicy = CastSession.ReconnectPolicy(attemptInterval: interval, window: .seconds(5))
+        try await session?.connect(to: device)
+
+        first.drop(with: CastError.connectionFailed("gone"))
+        try await eventually { second.heldSendCount == 1 }
+        session = nil
+        #expect(weakSession == nil)
+
+        second.releaseHeldSends()
+        try await eventually { second.sentMessages(ofType: "CLOSE").contains { $0.destinationID == CastEndpoint.platformReceiver } }
+        try await eventually { log.client(at: 1) == nil }
+        // Nothing is left to observe once the session is gone, so give a
+        // loop that wrongly kept going a few intervals to make a client.
+        try await Task.sleep(for: interval * 5)
+        #expect(log.count == 2)
+    }
+
+    @Test func connectDuringAReconnectAttemptDisconnectsTheAttemptsClient() async throws {
+        let mocks = (0..<3).map { _ in MockReceiver() }
+        mocks.forEach { Fixtures.installDefaultReceiver(on: $0) }
+        mocks[1].holdSends(ofType: "GET_STATUS")
+        let log = ClientLog(mocks)
+        let session = CastSession { log.makeClient($0) }
+        session.reconnectPolicy = CastSession.ReconnectPolicy(attemptInterval: .milliseconds(20), window: .seconds(5))
+        try await session.connect(to: device)
+
+        mocks[0].drop(with: CastError.connectionFailed("gone"))
+        try await eventually { mocks[1].heldSendCount == 1 }
+        try await session.connect(to: device)
+        let latest = log.client(at: 2)
+        #expect(session.isConnected)
+        #expect(session.client === latest)
+
+        mocks[1].releaseHeldSends()
+        try await eventually { mocks[1].sentMessages(ofType: "CLOSE").contains { $0.destinationID == CastEndpoint.platformReceiver } }
+        try await eventually { await MainActor.run { !session.hasReconnectLoop } }
+        #expect(session.isConnected)
+        #expect(session.client === latest)
+        #expect(log.count == 3)
+    }
+
+    @Test func connectSupersededDuringItsTeardownOpensNoClient() async throws {
+        let first = MockReceiver()
+        Fixtures.installDefaultReceiver(on: first)
+        let second = MockReceiver()
+        Fixtures.installDefaultReceiver(on: second)
+        let log = ClientLog([first, second])
+        let session = CastSession { log.makeClient($0) }
+        try await session.connect(to: device)
+
+        first.holdSends(ofType: "CLOSE")
+        let superseded = Task { try await session.connect(to: device) }
+        try await eventually { first.heldSendCount == 1 }
+        // In a task so a regression that also waits on the held CLOSE fails
+        // the checks below instead of hanging the test.
+        let superseding = Task { try await session.connect(to: device) }
+        try await eventually { await MainActor.run { session.isConnected && log.count == 2 } }
+        let latest = log.client(at: 1)
+        #expect(session.client === latest)
+
+        first.releaseHeldSends()
+        try await superseding.value
+        await #expect(throws: CancellationError.self) { try await superseded.value }
+        #expect(session.isConnected)
+        #expect(session.client === latest)
+        #expect(log.count == 2)
+    }
+
     @Test func statusReadAsTheConnectionDropsIsNotApplied() async throws {
         let first = MockReceiver()
         Fixtures.installDefaultReceiver(on: first)
