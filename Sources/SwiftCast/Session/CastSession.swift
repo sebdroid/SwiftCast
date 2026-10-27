@@ -166,7 +166,6 @@ public final class CastSession {
         // during it, or a newer connect or disconnect, already sees it as stale.
         epoch += 1
         let currentEpoch = epoch
-        reconnectTask?.cancel()
         await teardown(stopApplication: false)
         guard currentEpoch == epoch else { throw CancellationError() }
         connectionState = .connecting(device)
@@ -183,7 +182,10 @@ public final class CastSession {
     /// Disconnects from the device, optionally stopping the receiver app.
     public func disconnect(stopApplication: Bool = false) async {
         epoch += 1
+        let currentEpoch = epoch
         await teardown(stopApplication: stopApplication)
+        // A connect that ran while the old client was closing owns the state now.
+        guard currentEpoch == epoch else { return }
         connectionState = .disconnected
     }
 

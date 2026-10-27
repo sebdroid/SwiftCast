@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 import Testing
 @testable import SwiftCast
 
@@ -555,6 +556,37 @@ struct SessionTests {
         try await superseding.value
         await #expect(throws: CancellationError.self) { try await superseded.value }
         #expect(session.isConnected)
+        #expect(session.client === latest)
+        #expect(log.count == 2)
+    }
+
+    @Test func connectDuringADisconnectsTeardownKeepsItsConnection() async throws {
+        let first = MockReceiver()
+        Fixtures.installDefaultReceiver(on: first)
+        let second = MockReceiver()
+        Fixtures.installDefaultReceiver(on: second)
+        let log = ClientLog([first, second])
+        let session = CastSession { log.makeClient($0) }
+        try await session.connect(to: device)
+
+        first.holdSends(ofType: "CLOSE")
+        let disconnecting = Task { await session.disconnect() }
+        try await eventually { first.heldSendCount == 1 }
+        try await session.connect(to: device)
+        let latest = try #require(log.client(at: 1))
+        #expect(session.connectionState == .connected(device))
+        #expect(session.client === latest)
+
+        let changes = AttemptLog()
+        withObservationTracking {
+            _ = session.connectionState
+        } onChange: {
+            _ = changes.record()
+        }
+        first.releaseHeldSends()
+        await disconnecting.value
+        #expect(changes.count == 0)
+        #expect(session.connectionState == .connected(device))
         #expect(session.client === latest)
         #expect(log.count == 2)
     }
