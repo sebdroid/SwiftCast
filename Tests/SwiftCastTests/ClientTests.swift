@@ -101,6 +101,24 @@ struct ClientTests {
         #expect(mock.sentMessages(ofType: "PROBE").isEmpty)
     }
 
+    @Test func requestSettledBeforeItsWriteIsNeverWritten() async throws {
+        let mock = MockReceiver()
+        Fixtures.installDefaultReceiver(on: mock)
+        let client = makeClient(mock)
+        try await client.connect()
+        // Times the request out in the same turn that registers it, after its
+        // write is scheduled, with the caller still live and the connection up.
+        let options = CastClient.RequestOptions(onRegistered: { $0.expirePendingRequests(ofType: "PROBE") })
+        let result = await Task {
+            try await client.request(["type": "PROBE"] as JSONValue, namespace: .receiver, to: CastEndpoint.platformReceiver, timeout: .seconds(30), options: options)
+        }.result
+        #expect(throws: CastError.timeout) { try result.get() }
+        // A full round trip, so a write scheduled before it would have reached the mock by now.
+        try await client.receiver.getStatus()
+        #expect(mock.sentMessages(ofType: "PROBE").isEmpty)
+        #expect(await client.state == .connected)
+    }
+
     @Test func respondsToReceiverPings() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)

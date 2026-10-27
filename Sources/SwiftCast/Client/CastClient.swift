@@ -820,6 +820,15 @@ public actor CastClient {
         }
     }
 
+    /// Times out every pending request of `type` at once, as if its timer
+    /// fired. Tests use it from `onRegistered` to settle a request before its
+    /// write runs, which a real timer cannot be ordered to do.
+    func expirePendingRequests(ofType type: String) {
+        for (key, request) in pending where request.type == type {
+            resolve(key, with: .failure(CastError.timeout))
+        }
+    }
+
     private func resolve(_ key: PendingKey, with result: Result<InboundMessage, any Error>) {
         guard let request = pending.removeValue(forKey: key) else { return }
         request.timeoutTask.cancel()
