@@ -1034,6 +1034,33 @@ struct ClientTests {
         #expect(mocks[1].sentMessages(ofType: "CLOSE").isEmpty)
     }
 
+    @Test func joinedOpenAcrossAReconnectThrowsAndLeavesTheNewConnectionAlone() async throws {
+        let mocks = [MockReceiver(), MockReceiver()]
+        let index = Counter()
+        let client = CastClient { mocks[min(index.increment(), mocks.count) - 1] }
+        try await client.connect()
+        mocks[0].failsHeldSendsOnClose = false
+        mocks[0].holdSends(ofType: "CONNECT")
+        let staleOpen = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mocks[0].heldSendCount == 1 }
+        let staleJoiner = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.virtualConnectionIntent(for: Fixtures.transportID) == 2 }
+
+        mocks[0].drop(with: CastError.connectionFailed("wifi blip"))
+        try await eventually { await client.state != .connected }
+        try await client.connect()
+
+        mocks[0].releaseHeldSends(evenIfClosed: true)
+        _ = await staleOpen.result
+        await #expect(throws: CastError.notConnected) { try await staleJoiner.value }
+        #expect(mocks[1].sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.isEmpty)
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        #expect(mocks[1].sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 1)
+        #expect(await client.isConnected(to: Fixtures.transportID))
+    }
+
     @Test func destinationIsConnectedBeforeTheConnectWriteCompletes() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
