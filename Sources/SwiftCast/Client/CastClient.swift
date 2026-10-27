@@ -37,15 +37,17 @@ public actor CastClient {
 
     /// Tunable client behavior.
     public struct Configuration: Sendable {
-        /// Interval between heartbeat `PING`s.
-        public var heartbeatInterval: Duration = .seconds(5)
+        /// Interval between heartbeat `PING`s. Non-positive values use the
+        /// default of 5 seconds.
+        public var heartbeatInterval: Duration = Self.defaultHeartbeatInterval
         /// The connection is considered dead when nothing at all arrives
         /// within this long of a `PING` being sent. Any inbound message, not
         /// only `PONG`, counts as a sign of life.
         ///
         /// A dead receiver is noticed within this long of the next `PING`, so
         /// at most ``heartbeatInterval`` plus this long after its last message.
-        public var inactivityTimeout: Duration = .seconds(10)
+        /// Non-positive values use the default of 10 seconds.
+        public var inactivityTimeout: Duration = Self.defaultInactivityTimeout
         /// Default time to wait for a response to a request, such as a
         /// platform receiver request or a request on a custom namespace.
         public var requestTimeout: Duration = .seconds(5)
@@ -60,6 +62,17 @@ public actor CastClient {
         public var applicationConnectionType: ConnectionType = .strong
 
         public init() {}
+
+        static let defaultHeartbeatInterval: Duration = .seconds(5)
+        static let defaultInactivityTimeout: Duration = .seconds(10)
+
+        var effectiveHeartbeatInterval: Duration {
+            heartbeatInterval > .zero ? heartbeatInterval : Self.defaultHeartbeatInterval
+        }
+
+        var effectiveInactivityTimeout: Duration {
+            inactivityTimeout > .zero ? inactivityTimeout : Self.defaultInactivityTimeout
+        }
 
         @available(*, deprecated, renamed: "inactivityTimeout")
         public var heartbeatTimeout: Duration {
@@ -121,6 +134,7 @@ public actor CastClient {
     private var nextRequestID = 1
     private var connectedDestinations: Set<String> = []
     private var connectsInFlight: [String: Task<Void, any Error>] = [:]
+    private(set) var closesAwaitingOpen = 0
     private var launchInFlight: LaunchInFlight?
     private var nextLaunchID = 0
     private var protocolVersions: [String: Int] = [:]
@@ -401,12 +415,23 @@ public actor CastClient {
         }
     }
 
-    /// Closes the virtual connection to `destination`. If the connection is
-    /// still opening, this waits for the open to finish first.
+    /// Closes the virtual connection to `destination`.
+    ///
+    /// A close issued while the connection is still opening takes effect
+    /// only after that open completes, so the wire order is always `CONNECT`
+    /// then `CLOSE`. If that open fails there is nothing to close. A close
+    /// cancelled while it waits returns at once and changes nothing: the
+    /// connection stays as the open leaves it.
     public func closeVirtualConnection(to destination: String) async {
         if let inFlight = connectsInFlight[destination] {
             let generation = generation
-            _ = try? await inFlight.value
+            closesAwaitingOpen += 1
+            defer { closesAwaitingOpen -= 1 }
+            do {
+                try await awaitingCancellation(of: inFlight)
+            } catch {
+                return
+            }
             guard self.generation == generation else { return }
         }
         guard connectedDestinations.remove(destination) != nil else { return }
@@ -484,7 +509,7 @@ public actor CastClient {
             launchInFlight = LaunchInFlight(id: id, appID: appID, task: task)
         }
         defer { leaveLaunch(id) }
-        return try await joinedValue(of: task)
+        return try await awaitingCancellation(of: task)
     }
 
     /// The task of the pending launch, for tests.
@@ -729,7 +754,7 @@ public actor CastClient {
 
     private func startHeartbeat(generation: Int) {
         heartbeatTask?.cancel()
-        nextPing = .now + configuration.heartbeatInterval
+        nextPing = .now + configuration.effectiveHeartbeatInterval
         let firstWake = nextPing
         heartbeatTask = Task { [weak self] in
             var wake = firstWake
@@ -754,9 +779,9 @@ public actor CastClient {
             return nil
         }
         if now >= nextPing {
-            nextPing = now + configuration.heartbeatInterval
+            nextPing = now + configuration.effectiveHeartbeatInterval
             if inactivityDeadline == nil {
-                inactivityDeadline = now + configuration.inactivityTimeout
+                inactivityDeadline = now + configuration.effectiveInactivityTimeout
             }
             Task { await sendHeartbeat("PING", to: CastEndpoint.platformReceiver, generation: generation) }
         }
@@ -766,7 +791,11 @@ public actor CastClient {
 
     /// A failed heartbeat write means the socket is unusable, so the client
     /// is torn down at once instead of waiting for the inactivity timeout.
+    ///
+    /// The send is dropped when the connection it was scheduled for has
+    /// already been replaced, so it never goes out on a newer transport.
     private func sendHeartbeat(_ type: String, to destination: String, generation: Int) async {
+        guard generation == self.generation else { return }
         do {
             try await sendJSON(["type": .string(type)], namespace: .heartbeat, to: destination)
         } catch {
@@ -823,7 +852,8 @@ private enum JoinState<Success: Sendable>: Sendable {
 /// Waits for `task` without owning it, since `Task.value` ignores the
 /// waiter's cancellation: a cancelled waiter throws `CancellationError`
 /// promptly and `task` keeps running for its other callers.
-private func joinedValue<Success: Sendable>(of task: Task<Success, any Error>) async throws -> Success {
+@discardableResult
+private func awaitingCancellation<Success: Sendable>(of task: Task<Success, any Error>) async throws -> Success {
     let state = OSAllocatedUnfairLock<JoinState<Success>>(initialState: .waiting)
     return try await withTaskCancellationHandler {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Success, any Error>) in
