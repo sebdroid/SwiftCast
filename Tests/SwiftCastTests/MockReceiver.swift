@@ -71,15 +71,17 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
     }
 
     /// Completes every held send, failing them with ``cancelledSendError``
-    /// once the mock has been closed.
-    func releaseHeldSends() {
+    /// once the mock has been closed. `evenIfClosed` completes them
+    /// successfully regardless, like a write that finished just before the
+    /// connection was cancelled but whose completion arrives late.
+    func releaseHeldSends(evenIfClosed: Bool = false) {
         let (held, closed) = state.withLock { state in
             state.heldTypes = []
             defer { state.heldSends = [] }
             return (state.heldSends, state.isClosed)
         }
         for continuation in held {
-            if closed { continuation.resume(throwing: Self.cancelledSendError) } else { continuation.resume() }
+            if closed, !evenIfClosed { continuation.resume(throwing: Self.cancelledSendError) } else { continuation.resume() }
         }
     }
 

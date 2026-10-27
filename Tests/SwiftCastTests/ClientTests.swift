@@ -804,7 +804,7 @@ struct ClientTests {
         let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
         try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
         let closer = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
-        try await Task.sleep(for: .milliseconds(100))
+        try await eventually { await client.closesAwaitingOpen == 1 }
         #expect(mock.sentMessages(ofType: "CLOSE").isEmpty)
         mock.releaseHeldSends()
         try await opener.value
@@ -839,19 +839,96 @@ struct ClientTests {
         #expect(await client.isConnected(to: Fixtures.transportID))
     }
 
+    @Test func closeAfterAFailedOpenSendsNoClose() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        mock.failSends(ofType: "CONNECT", with: .connectionFailed("broken pipe"))
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let closer = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 1 }
+
+        mock.releaseHeldSends()
+        await #expect(throws: CastError.connectionFailed("broken pipe")) { try await opener.value }
+        await closer.value
+        #expect(mock.sentMessages(ofType: "CLOSE").isEmpty)
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+    }
+
+    @Test func cancelledCloseDuringOpenLeavesTheConnectionOpen() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+        let closer = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 1 }
+
+        closer.cancel()
+        try await eventually { await client.closesAwaitingOpen == 0 }
+        mock.releaseHeldSends()
+        try await opener.value
+        await closer.value
+        #expect(await client.isConnected(to: Fixtures.transportID))
+        #expect(mock.sentMessages(ofType: "CLOSE").isEmpty)
+    }
+
+    @Test func closeWaitingAcrossAReconnectLeavesTheReopenedConnection() async throws {
+        let mocks = [MockReceiver(), MockReceiver()]
+        let index = Counter()
+        let client = CastClient { mocks[min(index.increment(), mocks.count) - 1] }
+        try await client.connect()
+        mocks[0].failsHeldSendsOnClose = false
+        mocks[0].holdSends(ofType: "CONNECT")
+        let staleOpen = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mocks[0].sentMessages(ofType: "CONNECT").count == 2 }
+        let staleClose = Task { await client.closeVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { await client.closesAwaitingOpen == 1 }
+
+        mocks[0].drop(with: CastError.connectionFailed("wifi blip"))
+        try await eventually { await client.state != .connected }
+        try await client.connect()
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+
+        mocks[0].releaseHeldSends(evenIfClosed: true)
+        try await staleOpen.value
+        await staleClose.value
+        #expect(await client.isConnected(to: Fixtures.transportID))
+        #expect(mocks[1].sentMessages(ofType: "CLOSE").isEmpty)
+    }
+
+    @Test func destinationIsConnectedBeforeTheConnectWriteCompletes() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let opener = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.sentMessages(ofType: "CONNECT").count == 2 }
+
+        mock.push(["type": "CONNECTED", "protocolVersion": 1], namespace: .connection, from: Fixtures.transportID)
+        try await eventually { await client.negotiatedProtocolVersion(for: Fixtures.transportID) == 1 }
+        mock.releaseHeldSends()
+        try await opener.value
+        #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == 1)
+    }
+
     @Test func deviceAuthAcceptsBinaryPayloads() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
         try await client.connect()
-        var deviceAuth = client.messages(in: .deviceAuth).makeAsyncIterator()
-        var receiver = client.messages(in: .receiver).makeAsyncIterator()
+        var messages = client.messages().filter { $0.namespace != .heartbeat }.makeAsyncIterator()
         mock.push(payload: .binary(Data([1, 2, 3])), namespace: .deviceAuth)
         mock.push(payload: .binary(Data([4, 5, 6])), namespace: .receiver)
         mock.push(Fixtures.receiverStatus(level: 0.4), namespace: .receiver)
-        let auth = try #require(await deviceAuth.next())
-        #expect(auth.raw.payload == .binary(Data([1, 2, 3])))
-        let status = try #require(await receiver.next())
-        #expect(status.type == "RECEIVER_STATUS")
+        var beforeSentinel: [InboundMessage] = []
+        while let message = await messages.next(), message.type != "RECEIVER_STATUS" {
+            beforeSentinel.append(message)
+        }
+        #expect(beforeSentinel.map(\.namespace) == [.deviceAuth])
+        #expect(beforeSentinel.map(\.raw.payload) == [.binary(Data([1, 2, 3]))])
     }
 
     @Test func requestIDsAreSequentialPerClient() async throws {

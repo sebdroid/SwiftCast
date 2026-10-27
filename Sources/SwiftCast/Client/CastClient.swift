@@ -114,6 +114,7 @@ public actor CastClient {
     private var nextRequestID = 1
     private var connectedDestinations: Set<String> = []
     private var connectsInFlight: [String: Task<Void, any Error>] = [:]
+    private(set) var closesAwaitingOpen = 0
     private var protocolVersions: [String: Int] = [:]
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
@@ -365,12 +366,23 @@ public actor CastClient {
         }
     }
 
-    /// Closes the virtual connection to `destination`. If the connection is
-    /// still opening, this waits for the open to finish first.
+    /// Closes the virtual connection to `destination`.
+    ///
+    /// A close issued while the connection is still opening takes effect
+    /// only after that open completes, so the wire order is always `CONNECT`
+    /// then `CLOSE`. If that open fails there is nothing to close. A close
+    /// cancelled while it waits returns at once and changes nothing: the
+    /// connection stays as the open leaves it.
     public func closeVirtualConnection(to destination: String) async {
         if let inFlight = connectsInFlight[destination] {
             let generation = generation
-            _ = try? await inFlight.value
+            closesAwaitingOpen += 1
+            defer { closesAwaitingOpen -= 1 }
+            do {
+                try await awaitingCancellation(of: inFlight)
+            } catch {
+                return
+            }
             guard self.generation == generation else { return }
         }
         guard connectedDestinations.remove(destination) != nil else { return }
@@ -703,5 +715,43 @@ public actor CastClient {
         case "ERROR" where message.namespace == .media: return .mediaError(MediaErrorInfo(message))
         default: return nil
         }
+    }
+}
+
+private enum JoinState<Success: Sendable>: Sendable {
+    case waiting
+    case suspended(CheckedContinuation<Success, any Error>)
+    case finished
+}
+
+/// Waits for `task` without owning it, since `Task.value` ignores the
+/// waiter's cancellation: a cancelled waiter throws `CancellationError`
+/// promptly and `task` keeps running for its other callers.
+@discardableResult
+private func awaitingCancellation<Success: Sendable>(of task: Task<Success, any Error>) async throws -> Success {
+    let state = OSAllocatedUnfairLock<JoinState<Success>>(initialState: .waiting)
+    return try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Success, any Error>) in
+            let cancelled = state.withLock { state -> Bool in
+                guard case .waiting = state else { return true }
+                state = .suspended(continuation)
+                return false
+            }
+            guard !cancelled else { return continuation.resume(throwing: CancellationError()) }
+            Task {
+                let result = await task.result
+                state.withLock { state -> CheckedContinuation<Success, any Error>? in
+                    guard case .suspended(let continuation) = state else { return nil }
+                    state = .finished
+                    return continuation
+                }?.resume(with: result)
+            }
+        }
+    } onCancel: {
+        state.withLock { state -> CheckedContinuation<Success, any Error>? in
+            defer { state = .finished }
+            guard case .suspended(let continuation) = state else { return nil }
+            return continuation
+        }?.resume(throwing: CancellationError())
     }
 }
