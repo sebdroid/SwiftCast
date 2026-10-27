@@ -15,6 +15,7 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         var heldTypes: Set<String> = []
         var heldSends: [CheckedContinuation<Void, any Error>] = []
         var isOpen = false
+        var clientID: String?
         var isClosed = false
         var answersPings = true
         var failsHeldSendsOnClose = true
@@ -86,15 +87,17 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
     }
 
     /// Completes every held send, failing them with ``cancelledSendError``
-    /// once the mock has been closed.
-    func releaseHeldSends() {
+    /// once the mock has been closed. `evenIfClosed` completes them
+    /// successfully regardless, like a write that finished just before the
+    /// connection was cancelled but whose completion arrives late.
+    func releaseHeldSends(evenIfClosed: Bool = false) {
         let (held, closed) = state.withLock { state in
             state.heldTypes = []
             defer { state.heldSends = [] }
             return (state.heldSends, state.isClosed)
         }
         for continuation in held {
-            if closed { continuation.resume(throwing: Self.cancelledSendError) } else { continuation.resume() }
+            if closed, !evenIfClosed { continuation.resume(throwing: Self.cancelledSendError) } else { continuation.resume() }
         }
     }
 
@@ -112,6 +115,7 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
             let type = inbound.type ?? ""
             let (handler, failure, held, answersPings) = state.withLock { state -> (Handler?, CastError?, Bool, Bool) in
                 state.sent.append(inbound)
+                if state.clientID == nil { state.clientID = inbound.sourceID }
                 return (state.handlers[type], state.sendFailures[type], state.heldTypes.contains(type), state.answersPings)
             }
             if held {
@@ -157,10 +161,20 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
 
     // MARK: Device → client
 
-    /// Sends a JSON message from `source` to the client.
-    func push(_ json: JSONValue, namespace: CastNamespace, from source: String = CastEndpoint.platformReceiver, to destination: String = "sender-0") {
+    /// The sender id the client uses, learned from the first message it sent.
+    var clientID: String? { state.withLock { $0.clientID } }
+
+    /// Sends a JSON message from `source` to the client. `destination`
+    /// defaults to the client's own sender id, or `*` before it is known.
+    func push(_ json: JSONValue, namespace: CastNamespace, from source: String = CastEndpoint.platformReceiver, to destination: String? = nil) {
         let data = try! JSONEncoder().encode(json)
-        let message = CastMessage(sourceID: source, destinationID: destination, namespace: namespace.rawValue, payload: .string(String(decoding: data, as: UTF8.self)))
+        push(payload: .string(String(decoding: data, as: UTF8.self)), namespace: namespace, from: source, to: destination)
+    }
+
+    /// Sends a message with an arbitrary payload, such as malformed JSON or binary data.
+    func push(payload: CastMessage.Payload, namespace: CastNamespace, from source: String = CastEndpoint.platformReceiver, to destination: String? = nil) {
+        let destination = destination ?? clientID ?? CastEndpoint.broadcast
+        let message = CastMessage(sourceID: source, destinationID: destination, namespace: namespace.rawValue, payload: payload)
         continuation.yield(try! FrameCodec.frame(message))
     }
 

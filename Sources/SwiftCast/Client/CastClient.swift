@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os
 
 /// A connection to a single Cast device.
 ///
@@ -92,6 +93,19 @@ public actor CastClient {
     /// The most recent receiver status (from a request or broadcast).
     public private(set) var receiverStatus: ReceiverStatus?
 
+    /// Replies are matched on the namespace and peer a request went to as
+    /// well as its id, so a stray message reusing the id cannot answer it.
+    private struct PendingKey: Hashable {
+        let namespace: CastNamespace
+        let destination: String
+        let requestID: Int
+    }
+
+    private struct OpenInFlight {
+        let write: Task<Void, any Error>
+        let completion: OpenCompletion
+    }
+
     private struct PendingRequest {
         let continuation: CheckedContinuation<InboundMessage, any Error>
         let timeoutTask: Task<Void, Never>
@@ -101,9 +115,12 @@ public actor CastClient {
     private var transport: (any CastTransport)?
     private var generation = 0
     private var decoder = FrameDecoder()
-    private var pending: [Int: PendingRequest] = [:]
+    private var pending: [PendingKey: PendingRequest] = [:]
     private var nextRequestID = 1
     private var connectedDestinations: Set<String> = []
+    private var connectsInFlight: [String: OpenInFlight] = [:]
+    private var virtualConnectionIntents: [String: Int] = [:]
+    private(set) var closesAwaitingOpen = 0
     private var protocolVersions: [String: Int] = [:]
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
@@ -159,6 +176,7 @@ public actor CastClient {
         setState(.connecting)
         decoder = FrameDecoder()
         connectedDestinations = []
+        connectsInFlight = [:]
         protocolVersions = [:]
 
         let transport = makeTransport()
@@ -233,7 +251,16 @@ public actor CastClient {
         receiverStatusBroadcaster.subscribe(initial: receiverStatus)
     }
 
-    /// Streams every inbound message, optionally filtered to one namespace.
+    /// Streams inbound messages, optionally filtered to one namespace.
+    ///
+    /// Only messages addressed to this client's ``senderID`` or to the
+    /// broadcast id `*` are delivered. Apart from the transport namespaces
+    /// (`tp.connection`, `tp.heartbeat` and `tp.deviceauth`), a message is only
+    /// delivered when it comes from a peer with an open virtual connection,
+    /// so open one with ``openVirtualConnection(to:)`` before listening to an
+    /// application. On `urn:x-cast:com.google.cast.*` namespaces, payloads that
+    /// are not a JSON object are dropped; custom namespaces receive every
+    /// payload as is, with ``InboundMessage/json`` `nil` when it is not JSON.
     ///
     /// Streams end when the connection closes.
     public nonisolated func messages(in namespace: CastNamespace? = nil) -> AsyncStream<InboundMessage> {
@@ -279,6 +306,7 @@ public actor CastClient {
         }
         let requestID = nextRequestID
         nextRequestID = nextRequestID == Int32.max ? 1 : nextRequestID + 1
+        let key = PendingKey(namespace: namespace, destination: destination, requestID: requestID)
         object["requestId"] = .number(Double(requestID))
         let message = try Self.makeMessage(JSONValue.object(object), source: senderID, namespace: namespace, destination: destination)
         let timeout = timeout ?? configuration.requestTimeout
@@ -288,24 +316,24 @@ public actor CastClient {
                 let timeoutTask = Task { [weak self] in
                     try? await Task.sleep(for: timeout)
                     guard !Task.isCancelled else { return }
-                    await self?.resolve(requestID, with: .failure(CastError.timeout))
+                    await self?.resolve(key, with: .failure(CastError.timeout))
                 }
-                pending[requestID] = PendingRequest(continuation: continuation, timeoutTask: timeoutTask)
+                pending[key] = PendingRequest(continuation: continuation, timeoutTask: timeoutTask)
                 if Task.isCancelled {
                     // The cancellation handler may have run before registration.
-                    resolve(requestID, with: .failure(CancellationError()))
+                    resolve(key, with: .failure(CancellationError()))
                     return
                 }
                 Task {
                     do {
                         try await self.sendRaw(message)
                     } catch {
-                        self.resolve(requestID, with: .failure(error))
+                        self.resolve(key, with: .failure(error))
                     }
                 }
             }
         } onCancel: {
-            Task { await self.resolve(requestID, with: .failure(CancellationError())) }
+            Task { await self.resolve(key, with: .failure(CancellationError())) }
         }
 
         if let error = Self.standardError(in: response) { throw error }
@@ -315,25 +343,103 @@ public actor CastClient {
     // MARK: - Virtual connections
 
     /// Opens a virtual connection to `destination` (e.g. an app's `transportId`).
-    /// Does nothing if one is already open.
+    /// Does nothing if one is already open. A call made while another is still
+    /// opening the same connection waits for it and shares its result, then
+    /// opens again if the connection was closed before it resumed and no later
+    /// open or close has been issued. If the `CONNECT` write fails, the
+    /// call that issued it and every call waiting on it throw that write's
+    /// error. If the write succeeds but the client was torn down while it
+    /// was in flight, they all throw ``CastError/notConnected`` instead.
     public func openVirtualConnection(to destination: String) async throws {
-        guard !connectedDestinations.contains(destination) else { return }
-        // Inserted before sending so a CONNECTED reply handled while the send is suspended is recorded.
-        connectedDestinations.insert(destination)
-        do {
-            try await sendJSON(connectPayload(to: destination), namespace: .connection, to: destination)
-        } catch {
-            connectedDestinations.remove(destination)
-            protocolVersions[destination] = nil
-            throw error
+        let intent = recordIntent(for: destination)
+        let generation = generation
+        // Every join re-checks before looping, so the write below only ever
+        // runs with no open in flight, on the connection this call began on,
+        // and with no later open or close issued.
+        while let inFlight = connectsInFlight[destination] {
+            try await inFlight.write.value
+            guard self.generation == generation else { throw CastError.notConnected }
+            guard virtualConnectionIntents[destination] == intent, !connectedDestinations.contains(destination) else { return }
         }
+        guard !connectedDestinations.contains(destination) else { return }
+        // Registered before the write so a message the peer sends as soon as
+        // it sees CONNECT is not dropped as coming from an unknown peer.
+        connectedDestinations.insert(destination)
+        let payload = connectPayload(to: destination)
+        let completion = OpenCompletion()
+        let write = Task {
+            let result: Result<Void, any Error>
+            do {
+                try await sendJSON(payload, namespace: .connection, to: destination)
+                result = .success(())
+            } catch {
+                result = .failure(error)
+            }
+            // Settled here, before any waiter resumes, so nothing can observe
+            // a finished open that is still listed as in flight. After a
+            // reconnect the entries belong to the new connection.
+            if self.generation == generation {
+                if connectsInFlight[destination]?.completion === completion { connectsInFlight[destination] = nil }
+                if case .failure = result {
+                    connectedDestinations.remove(destination)
+                    protocolVersions[destination] = nil
+                }
+            }
+            completion.finish(result)
+            try result.get()
+        }
+        connectsInFlight[destination] = OpenInFlight(write: write, completion: completion)
+        try await write.value
+        guard self.generation == generation else { throw CastError.notConnected }
     }
 
     /// Closes the virtual connection to `destination`.
+    ///
+    /// A close issued while the connection is still opening takes effect
+    /// only after that open completes, so the wire order is always `CONNECT`
+    /// then `CLOSE`. If that open fails, or another open or close of the same
+    /// destination is issued while it waits, it does nothing: the later call
+    /// decides the outcome. A close cancelled while it waits returns at once
+    /// and changes nothing: the connection stays as the open leaves it, and
+    /// it does not count as a later call for closes that are still waiting.
     public func closeVirtualConnection(to destination: String) async {
+        let intent = recordIntent(for: destination)
+        if let inFlight = connectsInFlight[destination] {
+            let generation = generation
+            closesAwaitingOpen += 1
+            defer { closesAwaitingOpen -= 1 }
+            do {
+                try await inFlight.completion.wait()
+            } catch {
+                // A cancelled close decides nothing, so it must not supersede
+                // an earlier close still waiting. Only the latest call can be
+                // undone, so a later call keeps superseding as before.
+                if error is CancellationError, virtualConnectionIntents[destination] == intent {
+                    virtualConnectionIntents[destination] = intent - 1
+                }
+                return
+            }
+            guard self.generation == generation, virtualConnectionIntents[destination] == intent else { return }
+        }
         guard connectedDestinations.remove(destination) != nil else { return }
         protocolVersions[destination] = nil
         try? await sendJSON(Self.closePayload, namespace: .connection, to: destination)
+    }
+
+    private func recordIntent(for destination: String) -> Int {
+        let intent = virtualConnectionIntents[destination, default: 0] + 1
+        virtualConnectionIntents[destination] = intent
+        return intent
+    }
+
+    /// How many open and close calls have been issued for `destination`.
+    func virtualConnectionIntent(for destination: String) -> Int {
+        virtualConnectionIntents[destination, default: 0]
+    }
+
+    /// How many closes are suspended on the in-flight open of `destination`.
+    func closesWaitingOnOpen(to destination: String) -> Int {
+        connectsInFlight[destination]?.completion.waiterCount ?? 0
     }
 
     /// Whether a virtual connection to `destination` is currently open.
@@ -378,6 +484,11 @@ public actor CastClient {
 
     /// `reasonCode` 5 tells the receiver the sender closed the connection on purpose.
     static let closePayload: JSONValue = ["type": "CLOSE", "reasonCode": 5]
+
+    /// Namespaces that work below virtual connections, so they are accepted from any peer.
+    static let transportNamespaces: Set<CastNamespace> = [.connection, .heartbeat, .deviceAuth]
+
+    private static let logger = Logger(subsystem: "SwiftCast", category: "CastClient")
 
     /// The protocol version the receiver reported in `CONNECTED` for `destination`.
     func negotiatedProtocolVersion(for destination: String) -> Int? {
@@ -484,8 +595,8 @@ public actor CastClient {
         stateBroadcaster.yield(newState)
     }
 
-    private func resolve(_ requestID: Int, with result: Result<InboundMessage, any Error>) {
-        guard let request = pending.removeValue(forKey: requestID) else { return }
+    private func resolve(_ key: PendingKey, with result: Result<InboundMessage, any Error>) {
+        guard let request = pending.removeValue(forKey: key) else { return }
         request.timeoutTask.cancel()
         request.continuation.resume(with: result)
     }
@@ -504,6 +615,7 @@ public actor CastClient {
     }
 
     private func handle(_ message: InboundMessage) {
+        guard accepts(message) else { return }
         switch message.namespace {
         case .heartbeat:
             if message.type == "PING" {
@@ -528,7 +640,7 @@ public actor CastClient {
             default:
                 break
             }
-        case .receiver:
+        case .receiver where message.sourceID == CastEndpoint.platformReceiver:
             if message.type == "RECEIVER_STATUS", let status = try? message.json?["status"]?.decode(ReceiverStatus.self) {
                 updateReceiverStatus(status)
             }
@@ -536,10 +648,36 @@ public actor CastClient {
             break
         }
 
-        if let requestID = message.requestID, requestID != 0, pending[requestID] != nil {
-            resolve(requestID, with: .success(message))
+        if let requestID = message.requestID, requestID != 0 {
+            resolve(PendingKey(namespace: message.namespace, destination: message.sourceID, requestID: requestID), with: .success(message))
         }
         messageBroadcaster.yield(message)
+    }
+
+    /// Whether an inbound message may be routed at all. Messages for other
+    /// senders, or with a payload a Google namespace cannot carry, are dropped
+    /// as chromium's and open screen's cast channel code do. Messages from
+    /// peers without a virtual connection are dropped too, `*` broadcasts
+    /// included. That is stricter than open screen's
+    /// virtual_connection_router.cc, which still delivers broadcasts to every
+    /// endpoint, but no controller here needs a broadcast from a peer it has
+    /// not connected to.
+    private func accepts(_ message: InboundMessage) -> Bool {
+        let namespace = message.namespace
+        guard message.destinationID == senderID || message.destinationID == CastEndpoint.broadcast else {
+            Self.logger.debug("Dropping \(namespace.rawValue, privacy: .public) message addressed to \(message.destinationID, privacy: .public)")
+            return false
+        }
+        guard Self.transportNamespaces.contains(namespace) || connectedDestinations.contains(message.sourceID) else {
+            Self.logger.debug("Dropping \(namespace.rawValue, privacy: .public) message from \(message.sourceID, privacy: .public), which has no virtual connection")
+            return false
+        }
+        // Device auth is binary by design; every other Google namespace speaks JSON objects.
+        if namespace.rawValue.hasPrefix("urn:x-cast:com.google.cast."), namespace != .deviceAuth, message.json?.objectValue == nil {
+            Self.logger.debug("Dropping \(namespace.rawValue, privacy: .public) message from \(message.sourceID, privacy: .public) whose payload is not a JSON object")
+            return false
+        }
+        return true
     }
 
     private func startHeartbeat(generation: Int) {
@@ -604,6 +742,7 @@ public actor CastClient {
         transport?.close()
         transport = nil
         connectedDestinations = []
+        connectsInFlight = [:]
         protocolVersions = [:]
         let failures = pending
         pending = [:]
@@ -627,6 +766,87 @@ public actor CastClient {
         case "INVALID_PLAYER_STATE": return .invalidPlayerState(MediaErrorInfo(message))
         case "ERROR" where message.namespace == .media: return .mediaError(MediaErrorInfo(message))
         default: return nil
+        }
+    }
+}
+
+/// Lets closes wait for an in-flight open without owning its write.
+/// `Task.value` ignores the waiter's cancellation, so a cancelled waiter is
+/// resumed and dropped here at once instead of lingering until the write ends.
+private final class OpenCompletion: Sendable {
+    private enum Waiter: Sendable {
+        case starting
+        case cancelledBeforeStart
+        case waiting(CheckedContinuation<Void, any Error>)
+    }
+
+    private struct State: Sendable {
+        var result: Result<Void, any Error>?
+        // An entry lives from `wait()` until its continuation is resumed, so
+        // a cancellation that lands after `finish` finds nothing to record.
+        var waiters: [Int: Waiter] = [:]
+        var nextID = 0
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    var waiterCount: Int {
+        state.withLock { state in
+            state.waiters.values.count { if case .waiting = $0 { true } else { false } }
+        }
+    }
+
+    func finish(_ result: Result<Void, any Error>) {
+        let resumed = state.withLock { state in
+            state.result = result
+            var resumed: [CheckedContinuation<Void, any Error>] = []
+            for (id, waiter) in state.waiters {
+                guard case .waiting(let continuation) = waiter else { continue }
+                state.waiters[id] = nil
+                resumed.append(continuation)
+            }
+            return resumed
+        }
+        for continuation in resumed { continuation.resume(with: result) }
+    }
+
+    func wait() async throws {
+        let id = state.withLock { state in
+            defer { state.nextID += 1 }
+            state.waiters[state.nextID] = .starting
+            return state.nextID
+        }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                let ready = state.withLock { state -> Result<Void, any Error>? in
+                    if case .cancelledBeforeStart? = state.waiters[id] {
+                        state.waiters[id] = nil
+                        return .failure(CancellationError())
+                    }
+                    if let result = state.result {
+                        state.waiters[id] = nil
+                        return result
+                    }
+                    state.waiters[id] = .waiting(continuation)
+                    return nil
+                }
+                if let ready { continuation.resume(with: ready) }
+            }
+        } onCancel: {
+            // Each continuation is taken out under the lock exactly once, by
+            // either this handler or `finish`, so it is never resumed twice.
+            state.withLock { state -> CheckedContinuation<Void, any Error>? in
+                switch state.waiters[id] {
+                case .waiting(let continuation)?:
+                    state.waiters[id] = nil
+                    return continuation
+                case .starting?:
+                    state.waiters[id] = .cancelledBeforeStart
+                    return nil
+                case .cancelledBeforeStart?, nil:
+                    return nil
+                }
+            }?.resume(throwing: CancellationError())
         }
     }
 }
