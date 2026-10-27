@@ -33,38 +33,36 @@ public struct ReceiverController: Sendable {
     /// Only one launch may be pending per client at a time. A call for the
     /// same application meanwhile joins the pending launch instead of sending
     /// another `LAUNCH`: it shares that launch's reply, timeout and result,
-    /// and its own `timeout` and `onStatus` are ignored, so only the first
-    /// caller sees `LAUNCH_STATUS` updates. A cancelled call throws
-    /// `CancellationError` straight away, and the launch is cancelled only
-    /// when every caller waiting on it has been cancelled. A call for a different
-    /// application meanwhile throws ``CastError/requestInFlight(_:)``. If the application
-    /// is already running it is relaunched by the receiver; use
+    /// and its own `timeout` is ignored. Every caller still waiting on the
+    /// launch, whether it started it or joined it, gets each `LAUNCH_STATUS`
+    /// update through its own `onStatus`.
+    ///
+    /// A cancelled call throws `CancellationError` straight away, sending
+    /// nothing if it was cancelled before the call, and its `onStatus` is not
+    /// called again. The launch is cancelled only when every caller waiting
+    /// on it has been cancelled; a launch issued while that cancellation is
+    /// still settling waits for it and then sends a new `LAUNCH`. A call for a
+    /// different application while a launch is pending throws
+    /// ``CastError/requestInFlight(_:)``. If the application is already
+    /// running it is relaunched by the receiver; use
     /// ``CastClient/launchMediaApp(_:)`` to join instead.
     ///
     /// - Parameters:
     ///   - timeout: How long to wait for the whole launch, at most ``maximumLaunchTimeout``.
     ///   - onStatus: Called on the client's actor with the `status` of each
-    ///     `LAUNCH_STATUS` update, so it should return quickly.
+    ///     `LAUNCH_STATUS` update that arrives while this call is waiting, so
+    ///     it should return quickly.
     public func launch(
         _ appID: CastAppID,
         timeout: Duration = ReceiverController.defaultLaunchTimeout,
         onStatus: (@Sendable (String) -> Void)? = nil
     ) async throws -> CastApplication {
-        try await client.coalescedLaunch(appID) {
-            try await sendLaunch(appID, timeout: timeout, onStatus: onStatus)
+        try await client.coalescedLaunch(appID, onStatus: onStatus) { options in
+            try await sendLaunch(appID, timeout: timeout, options: options)
         }
     }
 
-    private func sendLaunch(
-        _ appID: CastAppID,
-        timeout: Duration,
-        onStatus: (@Sendable (String) -> Void)?
-    ) async throws -> CastApplication {
-        let options = CastClient.RequestOptions(exclusive: true, acceptsLaunchRequestID: true) { message in
-            guard message.type == "LAUNCH_STATUS" else { return true }
-            if let status = message.json?["status"]?.stringValue { onStatus?(status) }
-            return false
-        }
+    private func sendLaunch(_ appID: CastAppID, timeout: Duration, options: CastClient.RequestOptions) async throws -> CastApplication {
         let response = try await client.request(
             LaunchRequest(appId: appID),
             namespace: .receiver,

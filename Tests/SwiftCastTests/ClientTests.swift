@@ -602,6 +602,18 @@ struct ClientTests {
 
     // MARK: - Launch lifecycle
 
+    /// Names the case itself, since `==` on an open enum compares raw values
+    /// and would also accept `.unknown` carrying a known code.
+    func reasonCase(_ reason: LaunchErrorReason?) -> String? {
+        switch reason {
+        case nil: nil
+        case .userNotAllowed?: "userNotAllowed"
+        case .notificationDisabled?: "notificationDisabled"
+        case .applicationNotListed?: "applicationNotListed"
+        case .unknown(let raw)?: "unknown(\(raw))"
+        }
+    }
+
     static func appJSON(_ appID: String = "CC1AD845", sessionID: String, transportID: String) -> JSONValue {
         ["appId": .string(appID), "displayName": "App", "sessionId": .string(sessionID), "transportId": .string(transportID)]
     }
@@ -643,7 +655,7 @@ struct ClientTests {
         let client = makeClient(mock)
         try await client.connect()
         let error = await #expect(throws: CastError.self) { _ = try await client.receiver.launch(.defaultMediaReceiver) }
-        #expect(error?.launchErrorReason == .notificationDisabled)
+        #expect(reasonCase(error?.launchErrorReason) == "notificationDisabled")
     }
 
     @Test func launchRequestIDDoesNotAnswerOtherRequests() async throws {
@@ -683,14 +695,14 @@ struct ClientTests {
         try await client.connect()
         let error = await #expect(throws: CastError.self) { _ = try await client.receiver.launch(.defaultMediaReceiver) }
         #expect(error == .launchFailed(reason: "USER_NOT_ALLOWED"))
-        #expect(error?.launchErrorReason == .userNotAllowed)
+        #expect(reasonCase(error?.launchErrorReason) == "userNotAllowed")
     }
 
     @Test func launchErrorReasonDecodesDocumentedCodes() {
-        #expect(CastError.launchFailed(reason: "USER_NOT_ALLOWED").launchErrorReason == .userNotAllowed)
-        #expect(CastError.launchFailed(reason: "NOTIFICATION_DISABLED").launchErrorReason == .notificationDisabled)
-        #expect(CastError.launchFailed(reason: "APPLICATION_NOT_LISTED").launchErrorReason == .applicationNotListed)
-        #expect(CastError.launchFailed(reason: "NOT_FOUND").launchErrorReason == .unknown("NOT_FOUND"))
+        #expect(reasonCase(CastError.launchFailed(reason: "USER_NOT_ALLOWED").launchErrorReason) == "userNotAllowed")
+        #expect(reasonCase(CastError.launchFailed(reason: "NOTIFICATION_DISABLED").launchErrorReason) == "notificationDisabled")
+        #expect(reasonCase(CastError.launchFailed(reason: "APPLICATION_NOT_LISTED").launchErrorReason) == "applicationNotListed")
+        #expect(reasonCase(CastError.launchFailed(reason: "NOT_FOUND").launchErrorReason) == "unknown(NOT_FOUND)")
         #expect(CastError.launchFailed(reason: nil).launchErrorReason == nil)
         #expect(CastError.timeout.launchErrorReason == nil)
     }
@@ -708,7 +720,7 @@ struct ClientTests {
             _ = try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10))
         }
         #expect(ContinuousClock.now - start < .seconds(2))
-        #expect(error?.launchErrorReason == .applicationNotListed)
+        #expect(reasonCase(error?.launchErrorReason) == "applicationNotListed")
     }
 
     @Test func applicationOnThePlatformTransportIsNotALaunchedApp() async throws {
@@ -766,6 +778,7 @@ struct ClientTests {
                 secondStatuses.withLock { $0.append(status) }
             }
         }
+        try await eventually { await client.pendingLaunchWaiters == 2 }
         let launch = try #require(mock.sentMessages(ofType: "LAUNCH").first)
         // Longer than the joined caller's own timeout, which it does not use.
         try await Task.sleep(for: .milliseconds(300))
@@ -777,7 +790,7 @@ struct ClientTests {
         #expect(firstApp.transportId == Fixtures.transportID)
         #expect(mock.sentMessages(ofType: "LAUNCH").count == 1)
         #expect(firstStatuses.withLock { $0 } == ["USER_ALLOWED"])
-        #expect(secondStatuses.withLock { $0 }.isEmpty)
+        #expect(secondStatuses.withLock { $0 } == ["USER_ALLOWED"])
     }
 
     @Test func concurrentLaunchOfAnotherAppThrowsRequestInFlight() async throws {
@@ -813,7 +826,7 @@ struct ClientTests {
         let first = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
         try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
         let joined = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
-        try await Task.sleep(for: .milliseconds(50))
+        try await eventually { await client.pendingLaunchWaiters == 2 }
         joined.cancel()
         let joinedResult = await joined.result
         #expect(throws: CancellationError.self) { try joinedResult.get() }
@@ -848,7 +861,7 @@ struct ClientTests {
         let first = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
         try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
         let joined = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
-        try await Task.sleep(for: .milliseconds(50))
+        try await eventually { await client.pendingLaunchWaiters == 2 }
         first.cancel()
         let firstResult = await first.result
         #expect(throws: CancellationError.self) { try firstResult.get() }
@@ -866,7 +879,7 @@ struct ClientTests {
         let first = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
         try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
         let joined = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
-        try await Task.sleep(for: .milliseconds(50))
+        try await eventually { await client.pendingLaunchWaiters == 2 }
         first.cancel()
         let firstResult = await first.result
         #expect(throws: CancellationError.self) { try firstResult.get() }
@@ -901,6 +914,118 @@ struct ClientTests {
         _ = try await client.receiver.launch(.defaultMediaReceiver)
         _ = try await first.value
         #expect(mock.sentMessages(ofType: "LAUNCH").count == 2)
+    }
+
+    @Test func alreadyCancelledLaunchSendsNothing() async throws {
+        let mock = MockReceiver()
+        Fixtures.installDefaultReceiver(on: mock)
+        let client = makeClient(mock)
+        try await client.connect()
+        let cancelled = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await client.receiver.launch(.defaultMediaReceiver)
+        }
+        let cancelledResult = await cancelled.result
+        #expect(throws: CancellationError.self) { try cancelledResult.get() }
+        // A full round trip, so a LAUNCH started behind the cancelled call would have reached the client by now.
+        try await client.receiver.getStatus()
+        #expect(await client.lastTimeoutByRequestType["LAUNCH"] == nil)
+        #expect(mock.sentMessages(ofType: "LAUNCH").isEmpty)
+        #expect(await client.pendingLaunch == nil)
+        _ = try await client.receiver.launch(.defaultMediaReceiver)
+        #expect(mock.sentMessages(ofType: "LAUNCH").count == 1)
+    }
+
+    @Test func launchRightAfterTheLastWaiterCancelsSendsAFreshLaunch() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        for iteration in 1...50 {
+            let only = Task(priority: .background) { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+            try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 2 * iteration - 1 }
+            // The cancelled LAUNCH settles from a task at the waiter's low priority,
+            // so the relaunch tends to reach the client before it has.
+            let relaunch = Task(priority: .high) {
+                _ = await only.result
+                return try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10))
+            }
+            only.cancel()
+            let cancelledResult = await only.result
+            #expect(throws: CancellationError.self) { try cancelledResult.get() }
+            try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 2 * iteration }
+            let fresh = try #require(mock.sentMessages(ofType: "LAUNCH").last)
+            mock.reply(to: fresh, Fixtures.receiverStatus(apps: [Fixtures.mediaApp]))
+            let app = try await relaunch.value
+            #expect(app.transportId == Fixtures.transportID)
+        }
+        #expect(Set(mock.sentMessages(ofType: "LAUNCH").compactMap(\.requestID)).count == 100)
+    }
+
+    @Test func launchStatusReachesOnlyCallersStillWaiting() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let starterStatuses = OSAllocatedUnfairLock<[String]>(initialState: [])
+        let joinerStatuses = OSAllocatedUnfairLock<[String]>(initialState: [])
+        let starter = Task {
+            try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) { status in
+                starterStatuses.withLock { $0.append(status) }
+            }
+        }
+        try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
+        let joiner = Task {
+            try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) { status in
+                joinerStatuses.withLock { $0.append(status) }
+            }
+        }
+        try await eventually { await client.pendingLaunchWaiters == 2 }
+        starter.cancel()
+        let starterResult = await starter.result
+        #expect(throws: CancellationError.self) { try starterResult.get() }
+        let launch = try #require(mock.sentMessages(ofType: "LAUNCH").first)
+        mock.reply(to: launch, ["type": "LAUNCH_STATUS", "status": "USER_ALLOWED"])
+        mock.reply(to: launch, Fixtures.receiverStatus(apps: [Fixtures.mediaApp]))
+        _ = try await joiner.value
+        #expect(joinerStatuses.withLock { $0 } == ["USER_ALLOWED"])
+        #expect(starterStatuses.withLock { $0 }.isEmpty)
+    }
+
+    @Test func launchQueuedBehindTheFinalReplySendsANewLaunch() async throws {
+        let mock = MockReceiver()
+        let launches = Counter()
+        mock.on("LAUNCH") { request, mock in
+            if launches.increment() == 1 {
+                // In one chunk, so the late launch below is queued on the client until after the final reply.
+                mock.replyInOneChunk(to: request, [["type": "LAUNCH_STATUS", "status": "USER_ALLOWED"], Fixtures.receiverStatus(apps: [Fixtures.mediaApp])])
+            } else {
+                mock.reply(to: request, Fixtures.receiverStatus(apps: [Fixtures.mediaApp]))
+            }
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        let late = OSAllocatedUnfairLock<Task<CastApplication, any Error>?>(initialState: nil)
+        _ = try await client.receiver.launch(.defaultMediaReceiver) { _ in
+            late.withLock { $0 = $0 ?? Task { try await client.receiver.launch(.defaultMediaReceiver) } }
+        }
+        let lateTask = late.withLock { $0 }
+        let lateLaunch = try #require(lateTask)
+        _ = try await lateLaunch.value
+        #expect(mock.sentMessages(ofType: "LAUNCH").count == 2)
+    }
+
+    @Test func cancelledLaunchMediaAppThrowsEvenWhenTheStatusFetchIsCancelled() async throws {
+        let mock = MockReceiver()
+        mock.on("GET_STATUS") { request, mock in
+            guard request.namespace == .receiver else { return }
+            mock.reply(to: request, Fixtures.receiverStatus(apps: [Fixtures.mediaApp]))
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        let task = Task { try await client.launchMediaApp() }
+        try await eventually { mock.sentMessages(ofType: "GET_STATUS").contains { $0.namespace == .media } }
+        task.cancel()
+        let result = await task.result
+        #expect(throws: CancellationError.self) { try result.get() }
     }
 
     @Test func launchPassesTheDefaultAndClampedTimeoutToItsRequest() async throws {

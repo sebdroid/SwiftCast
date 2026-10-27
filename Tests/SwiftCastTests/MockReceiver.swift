@@ -166,6 +166,20 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         push(.object(object), namespace: request.namespace, from: request.destinationID, to: request.sourceID)
     }
 
+    /// Sends replies to `request`, each echoing its `requestId`, as a single
+    /// chunk so the client handles them all in one turn.
+    func replyInOneChunk(to request: InboundMessage, _ replies: [JSONValue]) {
+        var data = Data()
+        for json in replies {
+            var object = json.objectValue ?? [:]
+            if let id = request.requestID { object["requestId"] = .number(Double(id)) }
+            let payload = String(decoding: try! JSONEncoder().encode(JSONValue.object(object)), as: UTF8.self)
+            let message = CastMessage(sourceID: request.destinationID, destinationID: request.sourceID, namespace: request.namespace.rawValue, payload: .string(payload))
+            data.append(try! FrameCodec.frame(message))
+        }
+        continuation.yield(data)
+    }
+
     /// Simulates the connection dropping.
     func drop(with error: (any Error)? = nil) {
         if let error { continuation.finish(throwing: error) } else { continuation.finish() }

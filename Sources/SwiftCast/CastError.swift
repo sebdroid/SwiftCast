@@ -98,8 +98,8 @@ public enum LaunchErrorReason: OpenStringEnum {
     case userNotAllowed
     /// The device could not ask the user because its launch prompts are turned off.
     case notificationDisabled
-    /// Produced locally, not by a receiver: the reply to the launch listed
-    /// no matching application.
+    /// Produced locally when the launch reply lists no matching application;
+    /// a receiver that sent this code would decode the same way.
     case applicationNotListed
     case unknown(String)
 
