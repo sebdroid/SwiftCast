@@ -42,10 +42,10 @@ public final class CastSession {
         /// The pause before each attempt, measured from the loss for the
         /// first attempt and from the end of the previous attempt after that.
         public var attemptInterval: Duration
-        /// How long after the loss attempts may start. Once no further
-        /// attempt fits, the session moves to ``ConnectionState/failed(_:_:)``.
-        /// Every loss gets at least one attempt, even when `window` is
-        /// shorter than `attemptInterval`.
+        /// How long after the loss further attempts may start. The first
+        /// attempt always runs, `attemptInterval` after the loss, even when
+        /// that is past the window. Once no further attempt fits, the session
+        /// moves to ``ConnectionState/failed(_:_:)``.
         public var window: Duration
 
         var rejoinInterval: Duration = .seconds(1)
@@ -165,6 +165,10 @@ public final class CastSession {
 
     /// Connects to `device`, joining ``appID`` if it is already running.
     /// Any existing connection is closed first.
+    ///
+    /// Throws `CancellationError` if a newer ``connect(to:)`` or
+    /// ``disconnect(stopApplication:)`` starts before the new connection is
+    /// established, including while the existing connection is still closing.
     public func connect(to device: CastDevice) async throws {
         // Bumped before the teardown suspends, so anything that completes
         // during it, or a newer connect or disconnect, already sees it as stale.
