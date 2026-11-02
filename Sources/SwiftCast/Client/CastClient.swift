@@ -124,6 +124,8 @@ public actor CastClient {
         let timeoutTask: Task<Void, Never>
         let type: String?
         let options: RequestOptions
+        /// The flag the request's write checks, set as soon as its caller is cancelled.
+        let cancelled: OSAllocatedUnfairLock<Bool>
     }
 
     /// How a request is correlated with its replies and when it completes.
@@ -377,16 +379,25 @@ public actor CastClient {
         let response = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<InboundMessage, any Error>) in
                 // Checked here, where registration happens, so two callers cannot both pass.
-                if options.exclusive, let type, isPending(type, namespace: namespace, destination: destination) {
-                    continuation.resume(throwing: CastError.requestInFlight(type))
-                    return
+                if options.exclusive, let type {
+                    // A cancelled request leaves `pending` on the client's next
+                    // turn whatever the device does, so it is settled now
+                    // rather than blocking a request issued in the meantime.
+                    for (otherKey, other) in pending
+                    where other.type == type && otherKey.namespace == namespace && otherKey.destination == destination && other.cancelled.withLock({ $0 }) {
+                        resolve(otherKey, with: .failure(CancellationError()))
+                    }
+                    if isPending(type, namespace: namespace, destination: destination) {
+                        continuation.resume(throwing: CastError.requestInFlight(type))
+                        return
+                    }
                 }
                 let timeoutTask = Task { [weak self] in
                     try? await Task.sleep(for: timeout)
                     guard !Task.isCancelled else { return }
                     await self?.resolve(key, with: .failure(CastError.timeout))
                 }
-                pending[key] = PendingRequest(continuation: continuation, timeoutTask: timeoutTask, type: type, options: options)
+                pending[key] = PendingRequest(continuation: continuation, timeoutTask: timeoutTask, type: type, options: options, cancelled: cancelled)
                 if Task.isCancelled {
                     // The cancellation handler may have run before registration.
                     resolve(key, with: .failure(CancellationError()))

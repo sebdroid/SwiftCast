@@ -1285,6 +1285,25 @@ struct ClientTests {
         #expect(mock.sentMessages(ofType: "STOP").count == 1)
     }
 
+    @Test func stopRightAfterCancellingAPendingStopGoesAhead() async throws {
+        let mock = MockReceiver()
+        mock.on("STOP") { request, mock in
+            guard request.json?["sessionId"]?.stringValue == "another" else { return }
+            mock.reply(to: request, Fixtures.receiverStatus())
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        let first = Task { try await client.receiver.stop(sessionID: Fixtures.sessionID) }
+        try await eventually { mock.sentMessages(ofType: "STOP").count == 1 }
+        first.cancel()
+        try await client.receiver.stop(sessionID: "another")
+        let stops = mock.sentMessages(ofType: "STOP")
+        #expect(stops.count == 2)
+        #expect(stops.last?.json?["sessionId"]?.stringValue == "another")
+        let firstResult = await first.result
+        #expect(throws: CancellationError.self) { try firstResult.get() }
+    }
+
     @Test func requestInFlightDescription() {
         #expect(CastError.requestInFlight("LAUNCH").errorDescription == "A LAUNCH request is already in flight.")
     }
