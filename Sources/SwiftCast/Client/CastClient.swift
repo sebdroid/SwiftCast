@@ -599,11 +599,15 @@ public actor CastClient {
     ///
     /// A launch shared with other callers (see ``ReceiverController/launch(_:timeout:onStatus:)``)
     /// is cancelled only when every caller waiting on it has been cancelled.
-    /// A cancelled call throws `CancellationError` straight away, at any
-    /// stage, and stops receiving that launch's `LAUNCH_STATUS` updates.
-    /// Cancelled while it attaches, it first closes the application's
-    /// virtual connection as ``mediaController(for:)`` does, waiting only for
-    /// that write. It never stops an application it launched.
+    /// A cancelled call throws `CancellationError` at once while it fetches
+    /// the receiver status or waits on the launch. Cancelled while the
+    /// application's `CONNECT` write is in flight, it throws once that write
+    /// has finished. Cancelled while it attaches, it closes the application's
+    /// virtual connection as ``mediaController(for:)`` does and waits for
+    /// that `CLOSE` write before it throws. It never sends `STOP` for an
+    /// application it launched, but as with ``MediaController/detach()``,
+    /// that `CLOSE` can end an application whose last connected sender this
+    /// client was.
     public func launchMediaApp(_ appID: CastAppID = .defaultMediaReceiver) async throws -> MediaController {
         let status = try await receiver.getStatus()
         let application: CastApplication
