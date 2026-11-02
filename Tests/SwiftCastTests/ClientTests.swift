@@ -1129,12 +1129,12 @@ struct ClientTests {
         let onlyResult = await only.result
         #expect(throws: CancellationError.self) { try onlyResult.get() }
         let waiting = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
-        // Gives the caller time to start waiting on the abandoned launch, which nothing exposes.
-        try await Task.sleep(for: .milliseconds(50))
+        try await eventually { await client.callersAwaitingCancelledLaunch == 1 }
         let start = ContinuousClock.now
         waiting.cancel()
         await #expect(throws: CancellationError.self) { try await settled(waiting) }
         #expect(ContinuousClock.now - start < .seconds(2))
+        #expect(await client.callersAwaitingCancelledLaunch == 0)
         openGate.finish()
         try await eventually { await client.pendingLaunch == nil }
         #expect(mock.sentMessages(ofType: "LAUNCH").isEmpty)

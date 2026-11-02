@@ -161,6 +161,8 @@ public actor CastClient {
     private var launchInFlight: LaunchInFlight?
     private var nextLaunchID = 0
     private var nextLaunchWaiter = 0
+    /// How many callers are waiting for a cancelled launch to settle, for tests.
+    private(set) var callersAwaitingCancelledLaunch = 0
     private var protocolVersions: [String: Int] = [:]
     /// The timeout the latest request of each payload `type` was given, for tests.
     private(set) var lastTimeoutByRequestType: [String: Duration] = [:]
@@ -636,7 +638,9 @@ public actor CastClient {
     ) async throws -> CastApplication {
         try Task.checkCancellation()
         while let abandoned = launchInFlight, abandoned.waiters.values.allSatisfy(\.hasDeparted) {
+            callersAwaitingCancelledLaunch += 1
             _ = try? await awaitingCancellation(of: abandoned.task)
+            callersAwaitingCancelledLaunch -= 1
             try Task.checkCancellation()
         }
         nextLaunchWaiter += 1
