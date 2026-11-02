@@ -102,8 +102,8 @@ struct ClientTests {
         mock.drop(with: CastError.connectionFailed("reset"))
         try await eventually { await client.state == .closed(.connectionFailed("reset")) }
 
-        var seen: [CastClient.State] = []
-        for await state in await client.stateUpdates() { seen.append(state) }
+        let updates = await client.stateUpdates()
+        let seen = await drain(updates)
         #expect(seen == [.closed(.connectionFailed("reset"))])
         #expect(await client.observationSubscriberCount == 0)
     }
@@ -116,18 +116,17 @@ struct ClientTests {
         try await eventually { await client.receiverStatus != nil }
         await client.disconnect()
 
-        var levels: [Double?] = []
-        for await status in await client.receiverStatusUpdates() { levels.append(status.volume?.level) }
+        let statuses = await client.receiverStatusUpdates()
+        let levels = await drain(statuses)?.map { $0.volume?.level }
         #expect(levels == [0.25])
         #expect(await client.observationSubscriberCount == 0)
 
         let fresh = MockReceiver()
         fresh.failOpen(with: .connectionFailed("refused"))
-        let neverConnected = makeClient(fresh)
-        await #expect(throws: CastError.self) { try await neverConnected.connect() }
-        var count = 0
-        for await _ in await neverConnected.receiverStatusUpdates() { count += 1 }
-        #expect(count == 0)
+        let failedToConnect = makeClient(fresh)
+        await #expect(throws: CastError.self) { try await failedToConnect.connect() }
+        let failedStatuses = await failedToConnect.receiverStatusUpdates()
+        #expect(await drain(failedStatuses)?.count == 0)
     }
 
     @Test func messagesMadeWhileClosedEndUntilTheNextConnect() async throws {
@@ -138,12 +137,8 @@ struct ClientTests {
         try await client.connect()
         await client.disconnect()
 
-        var all = 0
-        for await _ in client.messages() { all += 1 }
-        var filtered = 0
-        for await _ in client.messages(in: .receiver) { filtered += 1 }
-        #expect(all == 0)
-        #expect(filtered == 0)
+        #expect(await drain(client.messages())?.count == 0)
+        #expect(await drain(client.messages(in: .receiver))?.count == 0)
 
         try await client.connect()
         var messages = client.messages(in: .receiver).makeAsyncIterator()
@@ -2292,6 +2287,22 @@ func eventually(
 }
 
 struct TimedOut: Error {}
+
+/// Collects `stream` until it ends, recording an issue and returning `nil`
+/// if it has not ended within `timeout`.
+func drain<Element: Sendable>(
+    _ stream: AsyncStream<Element>,
+    within timeout: Duration = .seconds(2),
+    sourceLocation: SourceLocation = #_sourceLocation
+) async -> [Element]? {
+    let collecting = Task {
+        var elements: [Element] = []
+        for await element in stream { elements.append(element) }
+        return elements
+    }
+    defer { collecting.cancel() }
+    return try? await settled(collecting, within: timeout, sourceLocation: sourceLocation)
+}
 
 /// Waits for `task` to finish, recording an issue and throwing ``TimedOut``
 /// if it has not finished within `timeout`.
