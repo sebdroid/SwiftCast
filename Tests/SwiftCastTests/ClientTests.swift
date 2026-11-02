@@ -393,6 +393,21 @@ struct ClientTests {
         await #expect(throws: CastError.notConnected) { try await client.receiver.getStatus() }
     }
 
+    @Test func onSettledRunsWhenTheConnectionDrops() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let settlements = OSAllocatedUnfairLock(initialState: 0)
+        let options = CastClient.RequestOptions(onSettled: { _ in settlements.withLock { $0 += 1 } })
+        let request = Task {
+            try await client.request(["type": "GET_STATUS"] as JSONValue, namespace: .receiver, to: CastEndpoint.platformReceiver, timeout: nil, options: options)
+        }
+        try await eventually { mock.sentMessages(ofType: "GET_STATUS").count == 1 }
+        mock.drop(with: CastError.connectionFailed("reset"))
+        await #expect(throws: CastError.connectionFailed("reset")) { try await settled(request) }
+        #expect(settlements.withLock { $0 } == 1)
+    }
+
     @Test func receiverCloseTearsDownClient() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
@@ -1019,6 +1034,27 @@ struct ClientTests {
         #expect(Set(mock.sentMessages(ofType: "LAUNCH").compactMap(\.requestID)).count == 100)
     }
 
+    @Test func launchOfAnotherAppRightAfterCancellingTheOnlyCallerSendsItsOwnLaunch() async throws {
+        let mock = MockReceiver()
+        mock.on("LAUNCH") { request, mock in
+            guard request.json?["appId"]?.stringValue == CastAppID.youTube.rawValue else { return }
+            mock.reply(to: request, Fixtures.receiverStatus(apps: [Self.appJSON(CastAppID.youTube.rawValue, sessionID: "youtube-session", transportID: "web-9")]))
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        let only = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
+        only.cancel()
+        // From this task and without awaiting the cancelled call, so its waiter has not left the launch yet.
+        let app = try await client.receiver.launch(.youTube, timeout: .seconds(10))
+        #expect(app.appId == .youTube)
+        let launches = mock.sentMessages(ofType: "LAUNCH")
+        #expect(launches.count == 2)
+        #expect(launches.last?.json?["appId"]?.stringValue == CastAppID.youTube.rawValue)
+        let onlyResult = await only.result
+        #expect(throws: CancellationError.self) { try onlyResult.get() }
+    }
+
     @Test func launchStatusReachesOnlyCallersStillWaiting() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
@@ -1197,6 +1233,27 @@ struct ClientTests {
         #expect(closes(to: Fixtures.transportID, mock) == 0)
         #expect(mock.sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 1)
         #expect(await !joined.isClosed)
+    }
+
+    @Test func alreadyCancelledMediaControllerCallSendsNothing() async throws {
+        let mock = MockReceiver()
+        installMediaApp(on: mock) { _ in true }
+        let client = makeClient(mock)
+        try await client.connect()
+        let status = try await client.receiver.getStatus()
+        let app = try #require(status.application(.defaultMediaReceiver))
+        let intentBefore = await client.virtualConnectionIntent(for: Fixtures.transportID)
+        let cancelled = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await client.mediaController(for: app)
+        }
+        let cancelledResult = await cancelled.result
+        #expect(throws: CancellationError.self) { try cancelledResult.get() }
+        // A full round trip, so a write started behind the cancelled call would have reached the mock by now.
+        try await client.receiver.getStatus()
+        #expect(mock.sentMessages.filter { $0.destinationID == Fixtures.transportID }.isEmpty)
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+        #expect(await client.virtualConnectionIntent(for: Fixtures.transportID) == intentBefore)
     }
 
     @Test func launchPassesTheDefaultAndClampedTimeoutToItsRequest() async throws {

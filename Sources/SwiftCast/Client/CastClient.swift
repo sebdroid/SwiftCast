@@ -103,9 +103,10 @@ public actor CastClient {
     }
 
     /// The client's one pending launch. Each caller waiting on it is keyed
-    /// by a token and keeps its own `LaunchWaiter`. A launch with no waiters left
-    /// has been cancelled and stays recorded until its `LAUNCH` leaves
-    /// `pending`, so a new launch cannot collide with it.
+    /// by a token and keeps its own `LaunchWaiter`. A launch whose waiters
+    /// have all departed, whether or not they have left yet, has been
+    /// cancelled and stays recorded until its `LAUNCH` leaves `pending`, so a
+    /// new launch cannot collide with it.
     private struct LaunchInFlight {
         let id: Int
         let appID: CastAppID
@@ -554,7 +555,8 @@ public actor CastClient {
     /// virtual connection to it and fetching its current media status.
     ///
     /// A failed status fetch still returns the controller, but a cancelled
-    /// call throws `CancellationError`. A cancelled call that wrote the
+    /// call throws `CancellationError`. A call that is already cancelled
+    /// throws without writing anything. A cancelled call that wrote the
     /// application's `CONNECT` itself closes that virtual connection again
     /// before it throws, unless another open or close of it has been issued
     /// since, as by a concurrent call for the same application. A cancelled
@@ -563,6 +565,7 @@ public actor CastClient {
     /// ``MediaController/detach()``, that `CLOSE` can end an application
     /// whose last connected sender this client was.
     public func mediaController(for application: CastApplication) async throws -> MediaController {
+        try Task.checkCancellation()
         let destination = application.transportId
         let generation = generation
         let openedIntent = try await openConnection(to: destination)
@@ -617,7 +620,7 @@ public actor CastClient {
         _ start: @escaping @Sendable (RequestOptions) async throws -> CastApplication
     ) async throws -> CastApplication {
         try Task.checkCancellation()
-        while let abandoned = launchInFlight, abandoned.waiters.isEmpty {
+        while let abandoned = launchInFlight, abandoned.waiters.values.allSatisfy(\.hasDeparted) {
             _ = try? await awaitingCancellation(of: abandoned.task)
             try Task.checkCancellation()
         }
@@ -993,6 +996,7 @@ public actor CastClient {
         pending = [:]
         for request in failures.values {
             request.timeoutTask.cancel()
+            request.options.onSettled?(self)
             request.continuation.resume(throwing: error ?? CastError.notConnected)
         }
         setState(.closed(error))
