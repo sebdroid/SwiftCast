@@ -225,13 +225,14 @@ struct ClientTests {
         let index = Counter()
         var configuration = CastClient.Configuration()
         configuration.heartbeatInterval = .milliseconds(50)
-        configuration.inactivityTimeout = .milliseconds(150)
+        configuration.inactivityTimeout = .seconds(30)
         let client = CastClient(configuration: configuration) { mocks[index.increment() - 1] }
 
         try await client.connect()
-        try await eventually { await client.state != .connected }
-        #expect(await client.state == .closed(.heartbeatTimeout))
         try await eventually { first.heldSendCount >= 1 }
+        first.drop()
+        try await eventually { await client.state != .connected }
+        #expect(await client.state == .closed(.connectionFailed("Connection closed by device")))
 
         try await client.connect()
         let states = await client.stateUpdates()
@@ -284,6 +285,32 @@ struct ClientTests {
         try await client.connect()
         try await eventually { mock.sentMessages(ofType: "PING").count >= 5 }
         #expect(await client.state == .connected)
+    }
+
+    @Test(arguments: [Duration.zero, .milliseconds(-1), .seconds(-30)])
+    func nonPositiveHeartbeatValuesFallBackToDefaults(_ value: Duration) {
+        var configuration = CastClient.Configuration()
+        configuration.heartbeatInterval = value
+        configuration.inactivityTimeout = value
+        #expect(configuration.effectiveHeartbeatInterval == .seconds(5))
+        #expect(configuration.effectiveInactivityTimeout == .seconds(10))
+    }
+
+    @Test func positiveHeartbeatValuesPassThrough() {
+        var configuration = CastClient.Configuration()
+        configuration.heartbeatInterval = .milliseconds(1)
+        configuration.inactivityTimeout = .milliseconds(2)
+        #expect(configuration.effectiveHeartbeatInterval == .milliseconds(1))
+        #expect(configuration.effectiveInactivityTimeout == .milliseconds(2))
+    }
+
+    @available(*, deprecated)
+    @Test func heartbeatTimeoutAliasesInactivityTimeout() {
+        var configuration = CastClient.Configuration()
+        configuration.heartbeatTimeout = .seconds(3)
+        #expect(configuration.inactivityTimeout == .seconds(3))
+        configuration.inactivityTimeout = .seconds(7)
+        #expect(configuration.heartbeatTimeout == .seconds(7))
     }
 
     @Test func defaultTimeouts() {
@@ -656,7 +683,7 @@ struct MockReceiverTests {
         mock.holdSends(ofType: "PING")
         let send = try await heldPing(on: mock)
         mock.close()
-        await #expect(throws: MockReceiver.cancelledSendError) { try await send.value }
+        await #expect(throws: MockReceiver.cancelledSendError) { try await settled(send) }
     }
 
     @Test func heldSendReleasedBeforeCloseSucceeds() async throws {
@@ -664,7 +691,7 @@ struct MockReceiverTests {
         mock.holdSends(ofType: "PING")
         let send = try await heldPing(on: mock)
         mock.releaseHeldSends()
-        try await send.value
+        try await settled(send)
         mock.close()
     }
 
@@ -675,7 +702,7 @@ struct MockReceiverTests {
         mock.failsHeldSendsOnClose = false
         mock.close()
         mock.releaseHeldSends()
-        await #expect(throws: MockReceiver.cancelledSendError) { try await send.value }
+        await #expect(throws: MockReceiver.cancelledSendError) { try await settled(send) }
     }
 
     @Test func answersPingsCanChangeAfterOpen() async throws {
@@ -693,13 +720,49 @@ struct MockReceiverTests {
 }
 
 /// Polls `condition` until it holds or the deadline passes.
-func eventually(timeout: Duration = .seconds(5), _ condition: @Sendable () async -> Bool) async throws {
+func eventually(
+    timeout: Duration = .seconds(5),
+    sourceLocation: SourceLocation = #_sourceLocation,
+    _ condition: @Sendable () async -> Bool
+) async throws {
     let deadline = ContinuousClock.now + timeout
     while ContinuousClock.now < deadline {
         if await condition() { return }
         try await Task.sleep(for: .milliseconds(10))
     }
-    Issue.record("Condition not met within \(timeout)")
+    Issue.record("Condition not met within \(timeout)", sourceLocation: sourceLocation)
+}
+
+struct TimedOut: Error {}
+
+/// Waits for `task` to finish, recording an issue and throwing ``TimedOut``
+/// if it has not finished within `timeout`.
+///
+/// `Task.value` ignores the waiter's cancellation, so awaiting a task that
+/// never finishes would outlive the suite's time limit.
+func settled<T: Sendable, F: Error>(
+    _ task: Task<T, F>,
+    within timeout: Duration = .seconds(5),
+    sourceLocation: SourceLocation = #_sourceLocation
+) async throws -> T {
+    let box = SettledResult<T>()
+    Task { box.store(await task.result.mapError { $0 as any Error }) }
+    try await eventually(timeout: timeout, sourceLocation: sourceLocation) { box.result != nil }
+    guard let result = box.result else { throw TimedOut() }
+    return try result.get()
+}
+
+final class SettledResult<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Result<T, any Error>?
+    var result: Result<T, any Error>? {
+        lock.lock(); defer { lock.unlock() }
+        return stored
+    }
+    func store(_ result: Result<T, any Error>) {
+        lock.lock(); defer { lock.unlock() }
+        stored = result
+    }
 }
 
 final class Counter: @unchecked Sendable {
