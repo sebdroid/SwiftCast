@@ -37,7 +37,8 @@ public actor CastClient {
     /// Tunable client behavior.
     public struct Configuration: Sendable {
         /// Interval between heartbeat `PING`s. Non-positive values use the
-        /// default of 5 seconds.
+        /// default of 5 seconds. Very small values send pings that often;
+        /// keep it in seconds.
         public var heartbeatInterval: Duration = Self.defaultHeartbeatInterval
         /// The connection is considered dead when nothing at all arrives
         /// within this long of a `PING` being sent. Any inbound message, not
