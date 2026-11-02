@@ -347,7 +347,8 @@ public actor CastClient {
     /// Does nothing if one is already open. A call made while another is still
     /// opening the same connection waits for it and shares its result, then
     /// opens again if the connection was closed before it resumed and no later
-    /// open or close has been issued. If the `CONNECT` write fails, the
+    /// open or close has been issued (a close cancelled while it waited on the
+    /// same open does not count). If the `CONNECT` write fails, the
     /// call that issued it and every call waiting on it throw that write's
     /// error. If the write succeeds but the client was torn down while it
     /// was in flight, they all throw ``CastError/notConnected`` instead.
@@ -356,11 +357,16 @@ public actor CastClient {
         let generation = generation
         // Every join re-checks before looping, so the write below only ever
         // runs with no open in flight, on the connection this call began on,
-        // and with no later open or close issued.
+        // and with no later open or close issued that still counts.
         while let inFlight = connectsInFlight[destination] {
             try await inFlight.write.value
+            // The write clears its own entry before it completes. Should that
+            // ever break, joining the finished write again would spin forever.
+            if connectsInFlight[destination]?.completion === inFlight.completion {
+                connectsInFlight[destination] = nil
+            }
             guard self.generation == generation else { throw CastError.notConnected }
-            guard virtualConnectionIntents[destination] == intent, !connectedDestinations.contains(destination) else { return }
+            guard isLatest(intent, for: destination, on: inFlight.completion), !connectedDestinations.contains(destination) else { return }
         }
         guard !connectedDestinations.contains(destination) else { return }
         // Registered before the write so a message the peer sends as soon as
@@ -401,8 +407,10 @@ public actor CastClient {
     /// then `CLOSE`. If that open fails, or another open or close of the same
     /// destination is issued while it waits, it does nothing: the later call
     /// decides the outcome. A close cancelled while it waits returns at once
-    /// and changes nothing: the connection stays as the open leaves it, and
-    /// it does not count as a later call for closes that are still waiting.
+    /// and changes nothing: the connection stays as the open leaves it. A
+    /// cancelled close steps aside for the closes still waiting on the same
+    /// open, whichever order the cancellations land in, provided the cancel
+    /// reaches the client before that open's write finishes.
     public func closeVirtualConnection(to destination: String) async {
         let intent = recordIntent(for: destination)
         if let inFlight = connectsInFlight[destination] {
@@ -410,21 +418,20 @@ public actor CastClient {
             closesAwaitingOpen += 1
             defer { closesAwaitingOpen -= 1 }
             do {
-                try await inFlight.completion.wait()
+                try await inFlight.completion.wait(intent: intent)
             } catch {
-                // A cancelled close decides nothing, so it must not supersede
-                // an earlier close still waiting. Only the latest call can be
-                // undone, so a later call keeps superseding as before.
-                if error is CancellationError, virtualConnectionIntents[destination] == intent {
-                    virtualConnectionIntents[destination] = intent - 1
-                }
                 return
             }
-            guard self.generation == generation, virtualConnectionIntents[destination] == intent else { return }
+            guard self.generation == generation, isLatest(intent, for: destination, on: inFlight.completion) else { return }
         }
         guard connectedDestinations.remove(destination) != nil else { return }
         protocolVersions[destination] = nil
         try? await sendJSON(Self.closePayload, namespace: .connection, to: destination)
+    }
+
+    private func isLatest(_ intent: Int, for destination: String, on completion: OpenCompletion) -> Bool {
+        let latest = virtualConnectionIntents[destination, default: 0]
+        return intent == latest || (intent < latest && completion.onlyCancelled(after: intent, through: latest))
     }
 
     private func recordIntent(for destination: String) -> Int {
@@ -769,7 +776,7 @@ public actor CastClient {
 /// Lets closes wait for an in-flight open without owning its write.
 /// `Task.value` ignores the waiter's cancellation, so a cancelled waiter is
 /// resumed and dropped here at once instead of lingering until the write ends.
-private final class OpenCompletion: Sendable {
+final class OpenCompletion: Sendable {
     private enum Waiter: Sendable {
         case starting
         case cancelledBeforeStart
@@ -778,10 +785,11 @@ private final class OpenCompletion: Sendable {
 
     private struct State: Sendable {
         var result: Result<Void, any Error>?
-        // An entry lives from `wait()` until its continuation is resumed, so
-        // a cancellation that lands after `finish` finds nothing to record.
+        // An entry lives from `wait(intent:)` until its continuation is
+        // resumed, so a cancellation that lands after `finish` finds nothing
+        // to record and `cancelled` is frozen once the open has finished.
         var waiters: [Int: Waiter] = [:]
-        var nextID = 0
+        var cancelled: Set<Int> = []
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
@@ -806,12 +814,16 @@ private final class OpenCompletion: Sendable {
         for continuation in resumed { continuation.resume(with: result) }
     }
 
-    func wait() async throws {
-        let id = state.withLock { state in
-            defer { state.nextID += 1 }
-            state.waiters[state.nextID] = .starting
-            return state.nextID
+    /// Whether every call issued after `intent`, up to and including
+    /// `latest`, was a close cancelled on this open before it finished.
+    func onlyCancelled(after intent: Int, through latest: Int) -> Bool {
+        state.withLock { state in
+            stride(from: intent + 1, through: latest, by: 1).allSatisfy(state.cancelled.contains)
         }
+    }
+
+    func wait(intent id: Int) async throws {
+        state.withLock { state in state.waiters[id] = .starting }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                 let ready = state.withLock { state -> Result<Void, any Error>? in
@@ -835,9 +847,13 @@ private final class OpenCompletion: Sendable {
                 switch state.waiters[id] {
                 case .waiting(let continuation)?:
                     state.waiters[id] = nil
+                    state.cancelled.insert(id)
                     return continuation
-                case .starting?:
+                case .starting? where state.result == nil:
                     state.waiters[id] = .cancelledBeforeStart
+                    state.cancelled.insert(id)
+                    return nil
+                case .starting?:
                     return nil
                 case .cancelledBeforeStart?, nil:
                     return nil
