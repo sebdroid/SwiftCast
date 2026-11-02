@@ -41,8 +41,8 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         set { state.withLock { $0.failsHeldSendsOnClose = newValue } }
     }
 
-    /// What `NetworkTransport` surfaces for a send that `NWConnection`
-    /// cancels (`ECANCELED`).
+    /// Stands in for the error `NetworkTransport` surfaces when `NWConnection`
+    /// cancels a send (`ECANCELED`); the real message is the `NWError` description.
     static let cancelledSendError = CastError.connectionFailed("Operation canceled")
 
     init() {

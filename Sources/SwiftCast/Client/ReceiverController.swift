@@ -84,7 +84,8 @@ public struct ReceiverController: Sendable {
     /// Stops a running application session.
     ///
     /// Only one stop may be pending per client at a time; a second call
-    /// meanwhile throws ``CastError/requestInFlight(_:)``.
+    /// meanwhile throws ``CastError/requestInFlight(_:)``. A stop issued after
+    /// a pending one was cancelled goes ahead.
     @discardableResult
     public func stop(sessionID: String) async throws -> ReceiverStatus {
         let response = try await client.request(
