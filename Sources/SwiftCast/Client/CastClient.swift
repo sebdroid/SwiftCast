@@ -698,7 +698,8 @@ public actor CastClient {
         for waiter in launch.waiters.values where !waiter.hasDeparted { waiter.onStatus?(status) }
     }
 
-    /// Also run from the launch task, for a `start` that fails before its request settles.
+    /// Also run from the launch task. That is the only cleanup for a `start`
+    /// that throws before its request registers, as with ``CastError/notConnected``.
     private func endLaunch(_ id: Int) {
         if launchInFlight?.id == id { launchInFlight = nil }
     }

@@ -1055,6 +1055,91 @@ struct ClientTests {
         #expect(throws: CancellationError.self) { try onlyResult.get() }
     }
 
+    @Test func launchThatFailsBeforeItsRequestRegistersCanBeRetried() async throws {
+        let client = makeClient(MockReceiver())
+        for _ in 1...2 {
+            let start = ContinuousClock.now
+            let attempt = Task { try await client.receiver.launch(.defaultMediaReceiver) }
+            await #expect(throws: CastError.notConnected) { try await settled(attempt) }
+            #expect(ContinuousClock.now - start < .seconds(2))
+            #expect(await client.pendingLaunch == nil)
+        }
+    }
+
+    @Test func sameAppCallerJoinsALaunchStartedBeforeTheCancelledOneFinished() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let (gate, openGate) = AsyncStream<Void>.makeStream()
+        let first = Task {
+            try await client.coalescedLaunch(.defaultMediaReceiver, onStatus: nil) { options in
+                let outcome: Result<InboundMessage, any Error>
+                do {
+                    outcome = .success(try await client.request(
+                        ["type": "LAUNCH", "appId": .string(CastAppID.defaultMediaReceiver.rawValue)] as JSONValue,
+                        namespace: .receiver,
+                        to: CastEndpoint.platformReceiver,
+                        timeout: .seconds(10),
+                        options: options
+                    ))
+                } catch {
+                    outcome = .failure(error)
+                }
+                // Unstructured, so the launch's cancellation cannot end the wait and its tail runs late.
+                await Task { for await _ in gate { break } }.value
+                _ = try outcome.get()
+                return try Fixtures.mediaApp.decode(CastApplication.self)
+            }
+        }
+        try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 1 }
+        let pending = await client.pendingLaunch
+        let cancelledLaunch = try #require(pending)
+        first.cancel()
+        let firstResult = await first.result
+        #expect(throws: CancellationError.self) { try firstResult.get() }
+        try await eventually { await client.pendingLaunch == nil }
+        let second = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        try await eventually { mock.sentMessages(ofType: "LAUNCH").count == 2 }
+        openGate.finish()
+        await #expect(throws: CancellationError.self) { try await settled(cancelledLaunch) }
+        let third = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        try await eventually { await client.pendingLaunchWaiters == 2 }
+        let launch = try #require(mock.sentMessages(ofType: "LAUNCH").last)
+        mock.reply(to: launch, Fixtures.receiverStatus(apps: [Fixtures.mediaApp]))
+        let thirdApp = try await settled(third)
+        #expect(thirdApp.transportId == Fixtures.transportID)
+        _ = try await settled(second)
+        #expect(mock.sentMessages(ofType: "LAUNCH").count == 2)
+    }
+
+    @Test func callerCancelledWhileWaitingOnAnAbandonedLaunchThrowsPromptly() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        let (gate, openGate) = AsyncStream<Void>.makeStream()
+        let only = Task {
+            try await client.coalescedLaunch(.defaultMediaReceiver, onStatus: nil) { _ in
+                // Unstructured, so the launch ignores its cancellation until the gate opens.
+                await Task { for await _ in gate { break } }.value
+                throw CancellationError()
+            }
+        }
+        try await eventually { await client.pendingLaunchWaiters == 1 }
+        only.cancel()
+        let onlyResult = await only.result
+        #expect(throws: CancellationError.self) { try onlyResult.get() }
+        let waiting = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        // Gives the caller time to start waiting on the abandoned launch, which nothing exposes.
+        try await Task.sleep(for: .milliseconds(50))
+        let start = ContinuousClock.now
+        waiting.cancel()
+        await #expect(throws: CancellationError.self) { try await settled(waiting) }
+        #expect(ContinuousClock.now - start < .seconds(2))
+        openGate.finish()
+        try await eventually { await client.pendingLaunch == nil }
+        #expect(mock.sentMessages(ofType: "LAUNCH").isEmpty)
+    }
+
     @Test func launchStatusReachesOnlyCallersStillWaiting() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
