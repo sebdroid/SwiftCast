@@ -450,6 +450,11 @@ public actor CastClient {
         connectsInFlight[destination]?.completion.waiterCount ?? 0
     }
 
+    /// Whether an open of `destination` has its `CONNECT` write in flight.
+    func isOpening(_ destination: String) -> Bool {
+        connectsInFlight[destination] != nil
+    }
+
     /// Whether a virtual connection to `destination` is currently open.
     public func isConnected(to destination: String) -> Bool {
         connectedDestinations.contains(destination)

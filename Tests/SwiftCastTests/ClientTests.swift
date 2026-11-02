@@ -893,11 +893,11 @@ struct ClientTests {
 
         try await eventually { await client.closesWaitingOnOpen(to: Fixtures.transportID) == 1 }
         closer.cancel()
-        await closer.value
-        #expect(await client.closesAwaitingOpen == 0)
+        try await eventually { await client.closesAwaitingOpen == 0 }
         #expect(await client.closesWaitingOnOpen(to: Fixtures.transportID) == 0)
         mock.releaseHeldSends()
         try await opener.value
+        await closer.value
         #expect(await client.isConnected(to: Fixtures.transportID))
         #expect(mock.sentMessages(ofType: "CLOSE").isEmpty)
     }
@@ -915,11 +915,12 @@ struct ClientTests {
         try await eventually { await client.closesWaitingOnOpen(to: Fixtures.transportID) == 2 }
 
         cancelledClose.cancel()
-        await cancelledClose.value
+        try await eventually { await client.closesAwaitingOpen == 1 }
         #expect(await client.virtualConnectionIntent(for: Fixtures.transportID) == 3)
         mock.releaseHeldSends()
         try await opener.value
         await firstClose.value
+        await cancelledClose.value
         let wire = mock.sentMessages.filter { $0.destinationID == Fixtures.transportID }.compactMap(\.type)
         #expect(wire == ["CONNECT", "CLOSE"])
         #expect(await !client.isConnected(to: Fixtures.transportID))
@@ -939,11 +940,12 @@ struct ClientTests {
             withUnsafeCurrentTask { $0?.cancel() }
             await client.closeVirtualConnection(to: Fixtures.transportID)
         }
-        await cancelledClose.value
-        #expect(await client.virtualConnectionIntent(for: Fixtures.transportID) == 3)
+        try await eventually { await client.virtualConnectionIntent(for: Fixtures.transportID) == 3 }
+        try await eventually { await client.closesAwaitingOpen == 1 }
         mock.releaseHeldSends()
         try await opener.value
         await firstClose.value
+        await cancelledClose.value
         let wire = mock.sentMessages.filter { $0.destinationID == Fixtures.transportID }.compactMap(\.type)
         #expect(wire == ["CONNECT", "CLOSE"])
         #expect(await !client.isConnected(to: Fixtures.transportID))
@@ -1233,6 +1235,7 @@ struct ClientTests {
         #expect(await client.state == .connected)
         #expect(await client.isConnected(to: Fixtures.transportID))
         #expect(await client.closesWaitingOnOpen(to: Fixtures.transportID) == 0)
+        #expect(await !client.isOpening(Fixtures.transportID))
         #expect(mocks[1].sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 1)
         #expect(mocks[1].sentMessages(ofType: "CLOSE").isEmpty)
 
