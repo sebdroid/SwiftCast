@@ -120,6 +120,10 @@ public final class CastSession {
     /// client's latest status, so tests can land a loss in that suspension.
     @ObservationIgnored var onReceiverStatusRead: (@MainActor (ReceiverStatus) async -> Void)?
 
+    /// Awaited by the media status watcher before it stores a status, so
+    /// tests can land a loss in that suspension.
+    @ObservationIgnored var onMediaStatusRead: (@MainActor (MediaStatus?) async -> Void)?
+
     public init(appID: CastAppID = .defaultMediaReceiver) {
         self.appID = appID
         self.makeClient = { CastClient(device: $0) }
@@ -208,7 +212,7 @@ public final class CastSession {
     ) async throws -> MediaStatus {
         let controller = try await ensureMediaController()
         let status = try await controller.load(media, autoplay: autoplay, startTime: startTime, activeTrackIDs: activeTrackIDs, customData: customData)
-        apply(status)
+        apply(status, from: controller)
         return status
     }
 
@@ -223,7 +227,7 @@ public final class CastSession {
     public func loadQueue(_ items: [QueueItem], startIndex: Int = 0, repeatMode: RepeatMode = .off) async throws -> MediaStatus {
         let controller = try await ensureMediaController()
         let status = try await controller.loadQueue(items, startIndex: startIndex, repeatMode: repeatMode)
-        apply(status)
+        apply(status, from: controller)
         return status
     }
 
@@ -254,12 +258,14 @@ public final class CastSession {
     /// Sets the device volume (0–1).
     public func setVolume(_ level: Double) async throws {
         guard let client else { throw CastError.notConnected }
-        receiverStatus = try await client.receiver.setVolume(level)
+        let status = try await client.receiver.setVolume(level)
+        if self.client === client { receiverStatus = status }
     }
 
     public func setMuted(_ muted: Bool) async throws {
         guard let client else { throw CastError.notConnected }
-        receiverStatus = try await client.receiver.setMuted(muted)
+        let status = try await client.receiver.setMuted(muted)
+        if self.client === client { receiverStatus = status }
     }
 
     // MARK: - Private
@@ -461,7 +467,7 @@ public final class CastSession {
         }
         let task = Task { try await client.mediaController(for: app) }
         pendingAttach = (app.sessionId, task)
-        defer { if pendingAttach?.sessionID == app.sessionId { pendingAttach = nil } }
+        defer { if pendingAttach?.task == task { pendingAttach = nil } }
         let controller = try await task.value
         guard currentEpoch == epoch, self.client === client else { throw CastError.notConnected }
         mediaTask?.cancel()
@@ -472,7 +478,11 @@ public final class CastSession {
         let updates = await controller.statusUpdates()
         mediaTask = Task { [weak self] in
             for await status in updates {
-                guard let self, currentEpoch == self.epoch else { return }
+                guard let self, !Task.isCancelled, currentEpoch == self.epoch, self.mediaController === controller else { return }
+                if let onMediaStatusRead = self.onMediaStatusRead { await onMediaStatusRead(status) }
+                // A loss keeps the epoch, so the controller identity is what
+                // marks a status from a controller this session has left.
+                guard !Task.isCancelled, currentEpoch == self.epoch, self.mediaController === controller else { return }
                 self.mediaStatus = status
                 self.mediaStatusDate = Date()
             }
@@ -493,10 +503,13 @@ public final class CastSession {
 
     private func command(_ body: (MediaController) async throws -> MediaStatus?) async throws {
         guard let mediaController else { throw CastError.noMediaSession }
-        if let status = try await body(mediaController) { apply(status) }
+        if let status = try await body(mediaController) { apply(status, from: mediaController) }
     }
 
-    private func apply(_ status: MediaStatus) {
+    /// Stores a reply from `controller`, unless the session has moved on to
+    /// another controller (or none) while the request was in flight.
+    private func apply(_ status: MediaStatus, from controller: MediaController) {
+        guard mediaController === controller else { return }
         mediaStatus = status
         mediaStatusDate = Date()
     }

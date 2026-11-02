@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import os
 import Testing
 @testable import SwiftCast
 
@@ -591,6 +592,31 @@ struct SessionTests {
         #expect(log.count == 2)
     }
 
+    @Test func volumeReplyDuringDisconnectsCloseIsDropped() async throws {
+        let mock = MockReceiver()
+        Fixtures.installDefaultReceiver(on: mock)
+        let pending = OSAllocatedUnfairLock<InboundMessage?>(initialState: nil)
+        mock.on("SET_VOLUME") { request, _ in pending.withLock { $0 = request } }
+        let session = CastSession { _ in CastClient { mock } }
+        try await session.connect(to: device)
+
+        let setting = Task { try await session.setVolume(0.3) }
+        try await eventually { pending.withLock { $0 } != nil }
+        mock.holdSends(ofType: "CLOSE")
+        let disconnecting = Task { await session.disconnect() }
+        try await eventually { mock.heldSendCount == 1 }
+        let pendingRequest = pending.withLock { $0 }
+        let request = try #require(pendingRequest)
+        mock.reply(to: request, Fixtures.receiverStatus(level: 0.3))
+        _ = try await settled(setting)
+
+        mock.releaseHeldSends()
+        await disconnecting.value
+        #expect(session.connectionState == .disconnected)
+        #expect(session.client == nil)
+        #expect(session.volume == nil)
+    }
+
     @Test func statusReadAsTheConnectionDropsIsNotApplied() async throws {
         let first = MockReceiver()
         Fixtures.installDefaultReceiver(on: first)
@@ -616,6 +642,33 @@ struct SessionTests {
         gate.open()
         try await eventually { await MainActor.run { resumed.value } }
         #expect(session.volume == 0.5)
+        await session.disconnect()
+    }
+
+    @Test func mediaStatusReadAsTheConnectionDropsIsNotApplied() async throws {
+        let first = MockReceiver()
+        Fixtures.installDefaultReceiver(on: first, appRunning: true)
+        let session = CastSession { _ in CastClient { first } }
+        session.reconnectPolicy = CastSession.ReconnectPolicy(attemptInterval: .seconds(30), window: .seconds(60))
+        try await session.connect(to: device)
+        #expect(session.mediaController != nil)
+
+        let gate = Gate()
+        let resumed = MainActorFlag()
+        session.onMediaStatusRead = { status in
+            guard status?.mediaSessionId == 7 else { return }
+            await gate.wait()
+            resumed.value = true
+        }
+        first.push(Fixtures.mediaStatus(sessionID: 7), namespace: .media, from: Fixtures.transportID)
+        try await eventually { gate.isWaiting }
+        first.drop(with: CastError.connectionFailed("gone"))
+        try await eventually { await MainActor.run { session.connectionState == .reconnecting(device, attempt: 1) } }
+
+        gate.open()
+        try await eventually { await MainActor.run { resumed.value } }
+        #expect(session.mediaStatus == nil)
+        #expect(session.mediaController == nil)
         await session.disconnect()
     }
 
