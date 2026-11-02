@@ -400,8 +400,6 @@ struct ClientTests {
         #expect(senderInfo["platform"] == 2)
         #elseif os(macOS)
         #expect(senderInfo["platform"] == 4)
-        #elseif os(Linux)
-        #expect(senderInfo["platform"] == 6)
         #else
         #expect(senderInfo["platform"] == 0)
         #endif

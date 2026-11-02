@@ -430,23 +430,18 @@ public actor CastClient {
         "watchOS"
         #elseif os(iOS)
         "iOS"
-        #elseif os(Linux)
-        "Linux"
         #else
         "unknown"
         #endif
     }
 
-    /// The `senderInfo.platform` value. Open screen's message_util.cc uses 2 for iOS,
-    /// 4 for macOS and 6 for linux; chromium sends 4 for every apple build and also
-    /// uses 6 for linux.
+    /// The `senderInfo.platform` value. Open screen's message_util.cc uses 2 for iOS
+    /// and 4 for macOS; chromium sends 4 for every apple build.
     static var senderPlatform: Int {
         #if os(iOS) || os(tvOS) || os(visionOS)
         2
         #elseif os(macOS)
         4
-        #elseif os(Linux)
-        6
         #else
         0
         #endif
