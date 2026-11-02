@@ -1066,9 +1066,9 @@ struct ClientTests {
         waiter.cancel()
         #expect(completion.onlyCancelled(after: 2, through: 3))
         #expect(completion.waiterCount == 0)
+        completion.finish(.success(()))
         await #expect(throws: CancellationError.self) { try await waiter.value }
 
-        completion.finish(.success(()))
         let lateWaiter = Task {
             withUnsafeCurrentTask { $0?.cancel() }
             try await completion.wait(intent: 4)
