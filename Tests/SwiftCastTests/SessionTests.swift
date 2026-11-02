@@ -581,6 +581,30 @@ struct SessionTests {
         #expect(log.count == 2)
     }
 
+    @Test func connectOvertakenWhileItsStatusFailsThrowsCancellation() async throws {
+        let first = MockReceiver()
+        first.on("GET_STATUS") { request, mock in
+            mock.reply(to: request, ["type": "INVALID_REQUEST", "reason": "INVALID_COMMAND"])
+        }
+        first.holdSends(ofType: "GET_STATUS")
+        let second = MockReceiver()
+        Fixtures.installDefaultReceiver(on: second)
+        let log = ClientLog([first, second])
+        let session = CastSession { log.makeClient($0) }
+
+        let overtaken = Task { try await session.connect(to: device) }
+        try await eventually { first.heldSendCount == 1 }
+        try await session.connect(to: device)
+        let latest = try #require(log.client(at: 1))
+
+        first.releaseHeldSends()
+        await #expect(throws: CancellationError.self) { try await overtaken.value }
+        #expect(session.connectionState == .connected(device))
+        #expect(session.client === latest)
+        #expect(first.sentMessages(ofType: "CLOSE").map(\.destinationID) == [CastEndpoint.platformReceiver])
+        #expect(log.count == 2)
+    }
+
     @Test func connectDuringADisconnectsTeardownKeepsItsConnection() async throws {
         let first = MockReceiver()
         Fixtures.installDefaultReceiver(on: first)

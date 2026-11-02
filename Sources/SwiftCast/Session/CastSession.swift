@@ -169,6 +169,8 @@ public final class CastSession {
     /// Throws `CancellationError` if a newer ``connect(to:)`` or
     /// ``disconnect(stopApplication:)`` starts before the new connection is
     /// established, including while the existing connection is still closing.
+    /// An overtaken attempt that then fails for another reason still throws
+    /// `CancellationError`, not that failure.
     public func connect(to device: CastDevice) async throws {
         // Bumped before the teardown suspends, so anything that completes
         // during it, or a newer connect or disconnect, already sees it as stale.
@@ -180,7 +182,7 @@ public final class CastSession {
         do {
             try await establish(device, epoch: currentEpoch)
         } catch {
-            guard currentEpoch == epoch else { throw error }
+            guard currentEpoch == epoch else { throw CancellationError() }
             let castError = (error as? CastError) ?? .connectionFailed(error.localizedDescription)
             connectionState = .failed(device, castError)
             throw castError
@@ -484,8 +486,9 @@ public final class CastSession {
             for await status in updates {
                 guard let self, !Task.isCancelled, currentEpoch == self.epoch, self.mediaController === controller else { return }
                 if let onMediaStatusRead = self.onMediaStatusRead { await onMediaStatusRead(status) }
-                // A loss keeps the epoch, so the controller identity is what
-                // marks a status from a controller this session has left.
+                // A loss keeps the epoch, so it is the cancellation (and, as a
+                // second guard, the controller identity) that drops a status
+                // from a controller this session has left.
                 guard !Task.isCancelled, currentEpoch == self.epoch, self.mediaController === controller else { return }
                 self.mediaStatus = status
                 self.mediaStatusDate = Date()
