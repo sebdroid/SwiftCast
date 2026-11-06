@@ -354,10 +354,9 @@ public actor CastClient {
     /// open or close has been issued (a close cancelled while it waited on the
     /// same open does not count). If the `CONNECT` write fails, the
     /// call that issued it and every call waiting on it throw that write's
-    /// error. If the client was torn down before the write started, nothing
-    /// is written and they all throw ``CastError/notConnected``. If the write
-    /// succeeds but the client was torn down while it was in flight, they all
-    /// throw ``CastError/notConnected`` instead.
+    /// error. If the client was torn down before the write started (nothing
+    /// is written) or while a successful write was in flight, they all throw
+    /// ``CastError/notConnected``.
     public func openVirtualConnection(to destination: String) async throws {
         let intent = recordIntent(for: destination)
         let generation = generation
