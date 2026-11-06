@@ -11,19 +11,45 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         var sent: [InboundMessage] = []
         var handlers: [String: Handler] = [:]
         var openError: CastError?
+        var sendFailures: [String: CastError] = [:]
+        var heldTypes: Set<String> = []
+        var heldSends: [CheckedContinuation<Void, any Error>] = []
         var sendFailure: (type: String, error: CastError)?
         var isOpen = false
+        var isClosed = false
+        var answersPings = true
+        var failsHeldSendsOnClose = true
     }
+
+    private enum HoldOutcome { case proceed, fail, held }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
     private let continuation: AsyncThrowingStream<Data, any Error>.Continuation
     let inbound: AsyncThrowingStream<Data, any Error>
     /// Automatically answer heartbeat PINGs from the client.
-    var answersPings = true
+    var answersPings: Bool {
+        get { state.withLock { $0.answersPings } }
+        set { state.withLock { $0.answersPings = newValue } }
+    }
+
+    /// Whether ``close()`` fails held sends straight away. `NWConnection`
+    /// completes outstanding sends with an error some time after it is
+    /// cancelled; turning this off leaves them held until
+    /// ``releaseHeldSends()`` so a test can choose when that failure lands.
+    var failsHeldSendsOnClose: Bool {
+        get { state.withLock { $0.failsHeldSendsOnClose } }
+        set { state.withLock { $0.failsHeldSendsOnClose = newValue } }
+    }
+
+    /// Stands in for the error `NetworkTransport` surfaces when `NWConnection`
+    /// cancels a send (`ECANCELED`); the real message is the `NWError` description.
+    static let cancelledSendError = CastError.connectionFailed("Operation canceled")
 
     init() {
         (inbound, continuation) = AsyncThrowingStream.makeStream()
     }
+
+    var isOpen: Bool { state.withLock { $0.isOpen } }
 
     /// Messages the client sent to the device, in order.
     var sentMessages: [InboundMessage] { state.withLock { $0.sent } }
@@ -41,9 +67,41 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         state.withLock { $0.openError = error }
     }
 
+    /// Makes sends of messages of the given `type` throw `error`. The failed
+    /// message is still recorded in ``sentMessages``.
+    func failSends(ofType type: String, with error: CastError) {
+        state.withLock { $0.sendFailures[type] = error }
+    }
+
     /// Records the next message of `type` as sent, then throws `error` from `send`.
     func failNextSend(ofType type: String, with error: CastError) {
         state.withLock { $0.sendFailure = (type, error) }
+    }
+
+    /// Makes sends of messages of the given `type` wait, after being
+    /// recorded, until ``releaseHeldSends()`` or ``close()`` is called.
+    func holdSends(ofType type: String) {
+        state.withLock { _ = $0.heldTypes.insert(type) }
+    }
+
+    /// The number of sends currently parked by ``holdSends(ofType:)``. A send
+    /// is recorded in ``sentMessages`` before it parks, so tests that need a
+    /// send to be held wait on this rather than on the message count.
+    var heldSendCount: Int {
+        state.withLock { $0.heldSends.count }
+    }
+
+    /// Completes every held send, failing them with ``cancelledSendError``
+    /// once the mock has been closed.
+    func releaseHeldSends() {
+        let (held, closed) = state.withLock { state in
+            state.heldTypes = []
+            defer { state.heldSends = [] }
+            return (state.heldSends, state.isClosed)
+        }
+        for continuation in held {
+            if closed { continuation.resume(throwing: Self.cancelledSendError) } else { continuation.resume() }
+        }
     }
 
     // MARK: CastTransport
@@ -57,26 +115,56 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         let output = state.withLock { $0.decoder.append(data) }
         for message in output.messages {
             let inbound = InboundMessage(message)
-            let (handler, failure) = state.withLock { state -> (Handler?, CastError?) in
+            let type = inbound.type ?? ""
+            let (handler, failure, nextFailure, held, answersPings) = state.withLock {
+                state -> (Handler?, CastError?, CastError?, Bool, Bool) in
                 state.sent.append(inbound)
-                var failure: CastError?
-                if let armed = state.sendFailure, armed.type == inbound.type {
-                    failure = armed.error
+                var nextFailure: CastError?
+                if let armed = state.sendFailure, armed.type == type {
+                    nextFailure = armed.error
                     state.sendFailure = nil
                 }
-                return (inbound.type.flatMap { state.handlers[$0] }, failure)
+                return (state.handlers[type], state.sendFailures[type], nextFailure, state.heldTypes.contains(type), state.answersPings)
             }
+            if held {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                    // `held` is only a hint: a close or release can land before
+                    // this point, so the outcome is decided and the continuation
+                    // registered in one transition against the current state.
+                    let outcome = state.withLock { state -> HoldOutcome in
+                        if state.isClosed, state.failsHeldSendsOnClose { return .fail }
+                        if state.heldTypes.contains(type) {
+                            state.heldSends.append(continuation)
+                            return .held
+                        }
+                        return state.isClosed ? .fail : .proceed
+                    }
+                    switch outcome {
+                    case .proceed: continuation.resume()
+                    case .fail: continuation.resume(throwing: Self.cancelledSendError)
+                    case .held: break
+                    }
+                }
+            }
+            if let failure { throw failure }
             if inbound.namespace == .heartbeat, inbound.type == "PING", answersPings {
                 reply(to: inbound, ["type": "PONG"])
             }
             handler?(inbound, self)
-            if let failure { throw failure }
+            if let nextFailure { throw nextFailure }
         }
         if let error = output.error { throw error }
     }
 
     func close() {
-        state.withLock { $0.isOpen = false }
+        let held = state.withLock { state -> [CheckedContinuation<Void, any Error>] in
+            state.isOpen = false
+            state.isClosed = true
+            guard state.failsHeldSendsOnClose else { return [] }
+            defer { state.heldSends = [] }
+            return state.heldSends
+        }
+        for continuation in held { continuation.resume(throwing: Self.cancelledSendError) }
         continuation.finish()
     }
 
