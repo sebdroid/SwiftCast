@@ -801,6 +801,27 @@ struct ClientTests {
         }
     }
 
+    @Test func broadcastCarryingOurLaunchIdDoesNotSettleTheLaunch() async throws {
+        let mock = MockReceiver()
+        let launchRequest = OSAllocatedUnfairLock<InboundMessage?>(initialState: nil)
+        mock.on("LAUNCH") { request, mock in
+            launchRequest.withLock { $0 = request }
+            var broadcast = Fixtures.receiverStatus(apps: [Self.appJSON("E8C28D3C", sessionID: "backdrop", transportID: "web-1")]).objectValue ?? [:]
+            broadcast["requestId"] = 0
+            broadcast["launchRequestId"] = .number(Double(request.requestID ?? 0))
+            mock.push(.object(broadcast), namespace: .receiver, to: "*")
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        let launch = Task { try await client.receiver.launch(.defaultMediaReceiver, timeout: .seconds(10)) }
+        try await eventually { await client.receiverStatus?.applications?.first?.sessionId == "backdrop" }
+        #expect(await client.pendingLaunch != nil)
+        let request = try #require(launchRequest.withLock { $0 })
+        mock.reply(to: request, Fixtures.receiverStatus(apps: [Fixtures.mediaApp]))
+        let app = try await settled(launch)
+        #expect(app.transportId == Fixtures.transportID)
+    }
+
     @Test func launchStatusAloneTimesOutOnce() async throws {
         let mock = MockReceiver()
         mock.on("LAUNCH") { request, mock in

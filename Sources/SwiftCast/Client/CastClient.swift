@@ -854,16 +854,18 @@ public actor CastClient {
 
     /// Completes the pending request a reply answers, unless its completion
     /// rule treats the reply as an intermediate update.
+    ///
+    /// A broadcast carries requestId 0, so launchRequestId is read only when
+    /// requestId is absent.
     private func correlate(_ message: InboundMessage) {
-        for case let (id?, isLaunchEcho) in [(message.requestID, false), (message.launchRequestID, true)] where id != 0 {
-            let key = PendingKey(namespace: message.namespace, destination: message.sourceID, requestID: id)
-            guard let request = pending[key], !isLaunchEcho || request.options.acceptsLaunchRequestID else { continue }
-            if request.options.isFinal(message) {
-                resolve(key, with: .success(message))
-            } else {
-                request.options.onUpdate?(self, message)
-            }
-            return
+        let candidate = message.requestID.map { ($0, false) } ?? message.launchRequestID.map { ($0, true) }
+        guard let (id, isLaunchEcho) = candidate, id != 0 else { return }
+        let key = PendingKey(namespace: message.namespace, destination: message.sourceID, requestID: id)
+        guard let request = pending[key], !isLaunchEcho || request.options.acceptsLaunchRequestID else { return }
+        if request.options.isFinal(message) {
+            resolve(key, with: .success(message))
+        } else {
+            request.options.onUpdate?(self, message)
         }
     }
 
