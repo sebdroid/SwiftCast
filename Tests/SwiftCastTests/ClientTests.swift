@@ -495,6 +495,22 @@ struct ClientTests {
         #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == nil)
     }
 
+    @Test func connectedHandledWhileTheConnectWriteIsSuspendedIsRecorded() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let open = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.heldSendCount == 1 }
+        mock.push(["type": "CONNECTED", "protocolVersion": 1], namespace: .connection, from: Fixtures.transportID)
+        try await eventually { await client.negotiatedProtocolVersion(for: Fixtures.transportID) == 1 }
+
+        mock.releaseHeldSends()
+        try await settled(open)
+        #expect(await client.isConnected(to: Fixtures.transportID))
+        #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == 1)
+    }
+
     @Test func connectedFromUnknownSourceIsIgnored() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
