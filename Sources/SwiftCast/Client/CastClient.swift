@@ -30,9 +30,10 @@ public actor CastClient {
     public enum ConnectionType: Int, Sendable {
         /// A regular sender connection, visible to the application as a connected sender.
         case strong = 0
-        /// A connection the application is not told about as a connected sender.
-        /// Receiver applications can only broadcast over an invisible connection, so replies
-        /// addressed to this sender may never arrive. Use it to listen, not for `MediaController`.
+        /// The application is not told about this sender and cannot address its own custom
+        /// messages to it, since receiver applications can only broadcast over an invisible
+        /// connection. Namespaces the receiver platform answers itself still reply; Chromium opens
+        /// every application connection this way and drives media over it.
         case invisible = 2
     }
 
