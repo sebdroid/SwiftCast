@@ -345,7 +345,7 @@ struct ClientFramingTests {
         try await client.connect()
         var messages = client.messages(in: .media).makeAsyncIterator()
 
-        let message = CastMessage(sourceID: "receiver-0", destinationID: "sender-0", namespace: CastNamespace.media.rawValue, payload: .string(#"{"type":"MEDIA_STATUS","status":[]}"#))
+        let message = CastMessage(sourceID: "receiver-0", destinationID: client.senderID, namespace: CastNamespace.media.rawValue, payload: .string(#"{"type":"MEDIA_STATUS","status":[]}"#))
         var stream = try FrameCodec.frame(message)
         stream.append(contentsOf: [0xFF, 0xFF, 0xFF, 0xFF])
         mock.pushRaw(stream)

@@ -54,7 +54,7 @@ public actor MediaController {
                 case .connection where message.sourceID == transportID && message.type == "CLOSE":
                     await self.close()
                     return
-                case .receiver where message.type == "RECEIVER_STATUS":
+                case .receiver where message.type == "RECEIVER_STATUS" && message.sourceID == CastEndpoint.platformReceiver:
                     // Receiver statuses always describe the full set of running apps.
                     let status = try? message.json?["status"]?.decode(ReceiverStatus.self)
                     if let status, !(status.applications ?? []).contains(where: { $0.sessionId == sessionID }) {
