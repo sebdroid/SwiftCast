@@ -122,12 +122,13 @@ struct ClientTests {
         let mock = MockReceiver()
         mock.answersPings = false
         let client = makeClient(mock) {
-            $0.heartbeatInterval = .milliseconds(200)
-            $0.inactivityTimeout = .milliseconds(400)
+            $0.heartbeatInterval = .milliseconds(100)
+            $0.inactivityTimeout = .milliseconds(600)
         }
         try await client.connect()
-        // The first PING arms the deadline; inbound traffic right after it
-        // clears it, so the next PING arms a fresh one.
+        // The first PING arms a deadline; inbound traffic right after it
+        // clears it, so the next PING goes out one interval later, well
+        // before that first deadline, and arms a fresh one.
         try await eventually { mock.sentMessages(ofType: "PING").count >= 1 }
         mock.push(Fixtures.receiverStatus(level: 0.3), namespace: .receiver, to: "*")
         try await eventually { await client.receiverStatus?.volume?.level == 0.3 }
@@ -135,7 +136,8 @@ struct ClientTests {
         try await eventually(timeout: .seconds(5)) { await client.state != .connected }
         let elapsed = ContinuousClock.now - lastInbound
         #expect(await client.state == .closed(.heartbeatTimeout))
-        #expect(elapsed < .milliseconds(1100))
+        #expect(mock.sentMessages(ofType: "PING").count == 2)
+        #expect(elapsed < .milliseconds(950))
     }
 
     @Test func intervalLongerThanTimeoutStillDetectsSilence() async throws {
@@ -168,6 +170,42 @@ struct ClientTests {
         try await eventually { await client.state != .connected }
         #expect(await client.state == .closed(.heartbeatTimeout))
         #expect(mock.sentMessages(ofType: "PING").count >= 1)
+    }
+
+    @Test func noPingIsSentWhileTrafficFlows() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(100)
+            $0.inactivityTimeout = .seconds(30)
+        }
+        try await client.connect()
+        for step in 1...25 {
+            mock.push(Fixtures.receiverStatus(level: Double(step) / 100), namespace: .receiver, to: "*")
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(mock.sentMessages(ofType: "PING").isEmpty)
+        #expect(await client.state == .connected)
+    }
+
+    @Test func pingIsSentAfterTheIntervalOfSilence() async throws {
+        let mock = MockReceiver()
+        mock.answersPings = false
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(100)
+            $0.inactivityTimeout = .milliseconds(700)
+        }
+        let start = ContinuousClock.now
+        try await client.connect()
+        try await eventually { mock.sentMessages(ofType: "PING").count >= 1 }
+        #expect(ContinuousClock.now - start >= .milliseconds(100))
+
+        try await Task.sleep(for: .milliseconds(350))
+        #expect(mock.sentMessages(ofType: "PING").count == 1)
+        #expect(await client.state == .connected)
+
+        try await eventually { await client.state != .connected }
+        #expect(await client.state == .closed(.heartbeatTimeout))
+        #expect(mock.sentMessages(ofType: "PING").count == 1)
     }
 
     @Test func anyInboundTrafficKeepsConnectionAlive() async throws {
