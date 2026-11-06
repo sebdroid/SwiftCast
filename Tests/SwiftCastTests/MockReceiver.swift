@@ -14,6 +14,7 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         var sendFailures: [String: CastError] = [:]
         var heldTypes: Set<String> = []
         var heldSends: [CheckedContinuation<Void, any Error>] = []
+        var sendFailure: (type: String, error: CastError)?
         var isOpen = false
         var isClosed = false
         var answersPings = true
@@ -72,6 +73,11 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         state.withLock { $0.sendFailures[type] = error }
     }
 
+    /// Records the next message of `type` as sent, then throws `error` from `send`.
+    func failNextSend(ofType type: String, with error: CastError) {
+        state.withLock { $0.sendFailure = (type, error) }
+    }
+
     /// Makes sends of messages of the given `type` wait, after being
     /// recorded, until ``releaseHeldSends()`` or ``close()`` is called.
     func holdSends(ofType type: String) {
@@ -110,9 +116,15 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
         for message in output.messages {
             let inbound = InboundMessage(message)
             let type = inbound.type ?? ""
-            let (handler, failure, held, answersPings) = state.withLock { state -> (Handler?, CastError?, Bool, Bool) in
+            let (handler, failure, nextFailure, held, answersPings) = state.withLock {
+                state -> (Handler?, CastError?, CastError?, Bool, Bool) in
                 state.sent.append(inbound)
-                return (state.handlers[type], state.sendFailures[type], state.heldTypes.contains(type), state.answersPings)
+                var nextFailure: CastError?
+                if let armed = state.sendFailure, armed.type == type {
+                    nextFailure = armed.error
+                    state.sendFailure = nil
+                }
+                return (state.handlers[type], state.sendFailures[type], nextFailure, state.heldTypes.contains(type), state.answersPings)
             }
             if held {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
@@ -139,6 +151,7 @@ final class MockReceiver: CastTransport, @unchecked Sendable {
                 reply(to: inbound, ["type": "PONG"])
             }
             handler?(inbound, self)
+            if let nextFailure { throw nextFailure }
         }
         if let error = output.error { throw error }
     }
