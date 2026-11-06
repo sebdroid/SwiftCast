@@ -210,6 +210,27 @@ struct ClientTests {
         #expect(mock.sentMessages(ofType: "PING").count >= 1)
     }
 
+    @Test func stalledPingWriteDoesNotStackUp() async throws {
+        let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(50)
+            $0.inactivityTimeout = .seconds(30)
+        }
+        try await client.connect()
+        for step in 1...20 {
+            mock.push(Fixtures.receiverStatus(level: Double(step) / 100), namespace: .receiver, to: "*")
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(mock.heldSendCount == 1)
+        #expect(mock.sentMessages(ofType: "PING").count == 1)
+        #expect(await client.state == .connected)
+
+        mock.releaseHeldSends()
+        try await eventually { mock.sentMessages(ofType: "PING").count >= 3 }
+        #expect(await client.state == .connected)
+    }
+
     @Test func anyInboundTrafficKeepsConnectionAlive() async throws {
         let mock = MockReceiver()
         mock.answersPings = false
@@ -524,6 +545,22 @@ struct ClientTests {
         #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == nil)
     }
 
+    @Test func connectedHandledWhileTheConnectWriteIsSuspendedIsRecorded() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.holdSends(ofType: "CONNECT")
+        let open = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { mock.heldSendCount == 1 }
+        mock.push(["type": "CONNECTED", "protocolVersion": 1], namespace: .connection, from: Fixtures.transportID)
+        try await eventually { await client.negotiatedProtocolVersion(for: Fixtures.transportID) == 1 }
+
+        mock.releaseHeldSends()
+        try await settled(open)
+        #expect(await client.isConnected(to: Fixtures.transportID))
+        #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == 1)
+    }
+
     @Test func connectedFromUnknownSourceIsIgnored() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
@@ -545,6 +582,27 @@ struct ClientTests {
         mock.push(Fixtures.receiverStatus(level: 0.3), namespace: .receiver, to: "*")
         try await eventually { await client.receiverStatus?.volume?.level == 0.3 }
         #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == nil)
+    }
+
+    @Test func failedApplicationConnectIsRolledBack() async throws {
+        let mock = MockReceiver()
+        mock.on("CONNECT") { request, mock in
+            guard request.destinationID == Fixtures.transportID else { return }
+            mock.push(["type": "CONNECTED", "protocolVersion": 1], namespace: .connection, from: request.destinationID, to: request.sourceID)
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.failNextSend(ofType: "CONNECT", with: .connectionFailed("write failed"))
+        await #expect(throws: CastError.self) { try await client.openVirtualConnection(to: Fixtures.transportID) }
+
+        mock.push(Fixtures.receiverStatus(level: 0.3), namespace: .receiver, to: "*")
+        try await eventually { await client.receiverStatus?.volume?.level == 0.3 }
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+        #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == nil)
+
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        #expect(await client.isConnected(to: Fixtures.transportID))
+        #expect(mock.sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 2)
     }
 
     @Test func connectDoesNotWaitForConnected() async throws {
@@ -2023,6 +2081,29 @@ struct ClientTests {
         #expect(mocks[1].sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 1)
     }
 
+    @Test func staleOpenerDoesNotWriteOnTheReconnectedTransport() async throws {
+        let mocks = [MockReceiver(), MockReceiver()]
+        let index = Counter()
+        let client = CastClient { mocks[min(index.increment(), mocks.count) - 1] }
+        try await client.connect()
+        let gate = OneShotGate()
+        await client.setOnConnectWriteStart { await gate.pass() }
+        let staleOpen = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { gate.isHolding }
+        #expect(await client.isOpening(Fixtures.transportID))
+
+        mocks[0].drop(with: CastError.connectionFailed("wifi blip"))
+        try await eventually { await client.state != .connected }
+        try await client.connect()
+
+        gate.open()
+        await #expect(throws: CastError.notConnected) { try await settled(staleOpen) }
+        #expect(mocks[1].sentMessages(ofType: "CONNECT").map(\.destinationID) == ["receiver-0"])
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+        #expect(await !client.isOpening(Fixtures.transportID))
+        #expect(await client.state == .connected)
+    }
+
     @Test func destinationIsConnectedBeforeTheConnectWriteCompletes() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
@@ -2182,6 +2263,39 @@ final class SettledResult<T: Sendable>: @unchecked Sendable {
     func store(_ result: Result<T, any Error>) {
         lock.lock(); defer { lock.unlock() }
         stored = result
+    }
+}
+
+/// Suspends the first caller of ``pass()`` until ``open()`` is called. Every
+/// other caller passes straight through.
+final class OneShotGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var used = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    var isHolding: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return waiter != nil
+    }
+    func pass() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            guard !used else {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            used = true
+            waiter = continuation
+            lock.unlock()
+        }
+    }
+    func open() {
+        lock.lock()
+        used = true
+        let held = waiter
+        waiter = nil
+        lock.unlock()
+        held?.resume()
     }
 }
 
