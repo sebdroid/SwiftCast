@@ -32,6 +32,8 @@ public actor CastClient {
         /// A regular sender connection, visible to the application as a connected sender.
         case strong = 0
         /// A connection the application is not told about as a connected sender.
+        /// Receiver applications can only broadcast over an invisible connection, so replies
+        /// addressed to this sender may never arrive. Use it to listen, not for `MediaController`.
         case invisible = 2
     }
 
@@ -163,6 +165,7 @@ public actor CastClient {
     private var nextLaunchWaiter = 0
     /// How many callers are waiting for a cancelled launch to settle, for tests.
     private(set) var callersAwaitingCancelledLaunch = 0
+    private var onConnectWriteStart: (@Sendable () async -> Void)?
     private var protocolVersions: [String: Int] = [:]
     /// The timeout the latest request of each payload `type` was given, for tests.
     private(set) var lastTimeoutByRequestType: [String: Duration] = [:]
@@ -170,6 +173,7 @@ public actor CastClient {
     private var heartbeatTask: Task<Void, Never>?
     private var nextPing = ContinuousClock.now
     private var inactivityDeadline: ContinuousClock.Instant?
+    private var pingInFlight = false
 
     private let messageBroadcaster = Broadcaster<InboundMessage>()
     private let stateBroadcaster = Broadcaster<State>()
@@ -453,8 +457,9 @@ public actor CastClient {
     /// open or close has been issued (a close cancelled while it waited on the
     /// same open does not count). If the `CONNECT` write fails, the
     /// call that issued it and every call waiting on it throw that write's
-    /// error. If the write succeeds but the client was torn down while it
-    /// was in flight, they all throw ``CastError/notConnected`` instead.
+    /// error. If the client was torn down before the write started (nothing
+    /// is written) or while a successful write was in flight, they all throw
+    /// ``CastError/notConnected``.
     public func openVirtualConnection(to destination: String) async throws {
         try await openConnection(to: destination)
     }
@@ -488,6 +493,8 @@ public actor CastClient {
         let write = Task {
             let result: Result<Void, any Error>
             do {
+                if let onConnectWriteStart { await onConnectWriteStart() }
+                guard self.generation == generation else { throw CastError.notConnected }
                 try await sendJSON(payload, namespace: .connection, to: destination)
                 result = .success(())
             } catch {
@@ -560,6 +567,12 @@ public actor CastClient {
     /// How many closes are suspended on the in-flight open of `destination`.
     func closesWaitingOnOpen(to destination: String) -> Int {
         connectsInFlight[destination]?.completion.waiterCount ?? 0
+    }
+
+    /// Installs a hook an open's write task awaits just before it checks the
+    /// connection and writes `CONNECT`.
+    func setOnConnectWriteStart(_ hook: (@Sendable () async -> Void)?) {
+        onConnectWriteStart = hook
     }
 
     /// Whether an open of `destination` has its `CONNECT` write in flight.
@@ -854,16 +867,18 @@ public actor CastClient {
 
     /// Completes the pending request a reply answers, unless its completion
     /// rule treats the reply as an intermediate update.
+    ///
+    /// A broadcast carries requestId 0, so launchRequestId is read only when
+    /// requestId is absent.
     private func correlate(_ message: InboundMessage) {
-        for case let (id?, isLaunchEcho) in [(message.requestID, false), (message.launchRequestID, true)] where id != 0 {
-            let key = PendingKey(namespace: message.namespace, destination: message.sourceID, requestID: id)
-            guard let request = pending[key], !isLaunchEcho || request.options.acceptsLaunchRequestID else { continue }
-            if request.options.isFinal(message) {
-                resolve(key, with: .success(message))
-            } else {
-                request.options.onUpdate?(self, message)
-            }
-            return
+        let candidate = message.requestID.map { ($0, false) } ?? message.launchRequestID.map { ($0, true) }
+        guard let (id, isLaunchEcho) = candidate, id != 0 else { return }
+        let key = PendingKey(namespace: message.namespace, destination: message.sourceID, requestID: id)
+        guard let request = pending[key], !isLaunchEcho || request.options.acceptsLaunchRequestID else { return }
+        if request.options.isFinal(message) {
+            resolve(key, with: .success(message))
+        } else {
+            request.options.onUpdate?(self, message)
         }
     }
 
@@ -962,6 +977,7 @@ public actor CastClient {
 
     private func startHeartbeat(generation: Int) {
         heartbeatTask?.cancel()
+        pingInFlight = false
         nextPing = .now + configuration.effectiveHeartbeatInterval
         let firstWake = nextPing
         heartbeatTask = Task { [weak self] in
@@ -978,7 +994,9 @@ public actor CastClient {
     /// Returns when the heartbeat loop should wake next, or `nil` to stop it.
     ///
     /// The `PING` is written from its own task so a write that never
-    /// completes cannot hold up the deadline check.
+    /// completes cannot hold up the deadline check. Only one `PING` write is
+    /// in flight at a time: inbound traffic keeps clearing the deadline, so
+    /// without that a stalled write would gain a new task every interval.
     private func heartbeatTick(generation: Int) -> ContinuousClock.Instant? {
         guard generation == self.generation, state == .connected else { return nil }
         let now = ContinuousClock.now
@@ -991,7 +1009,13 @@ public actor CastClient {
             if inactivityDeadline == nil {
                 inactivityDeadline = now + configuration.effectiveInactivityTimeout
             }
-            Task { await sendHeartbeat("PING", to: CastEndpoint.platformReceiver, generation: generation) }
+            if !pingInFlight {
+                pingInFlight = true
+                Task {
+                    await sendHeartbeat("PING", to: CastEndpoint.platformReceiver, generation: generation)
+                    if generation == self.generation { pingInFlight = false }
+                }
+            }
         }
         guard let inactivityDeadline else { return nextPing }
         return min(nextPing, inactivityDeadline)

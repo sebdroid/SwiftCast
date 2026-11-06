@@ -71,7 +71,7 @@ public struct ReceiverController: Sendable {
             options: options
         )
         let status = try decodeStatus(response)
-        guard let app = status.applications?.first(where: { $0.appId == appID && $0.transportId != CastEndpoint.platformReceiver }) else {
+        guard let app = status.applications?.first(where: { $0.appId == appID }) else {
             throw CastError.launchFailed(reason: LaunchErrorReason.applicationNotListed.rawValue)
         }
         return app

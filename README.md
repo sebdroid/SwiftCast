@@ -202,7 +202,7 @@ let messages = client.messages(in: namespace)
 let reply = try await client.request(["type": "HELLO"] as JSONValue, namespace: namespace, to: app.transportId)
 ```
 
-`request` correlates replies by `requestId`. Use `send` for fire-and-forget messages.
+`request` correlates replies by namespace, peer and `requestId`. Use `send` for fire-and-forget messages.
 
 ### Errors
 
