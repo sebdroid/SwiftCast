@@ -379,13 +379,58 @@ struct ClientTests {
         await #expect(throws: CastError.notConnected) { try await client.receiver.getStatus() }
     }
 
-    @Test func receiverCloseTearsDownClient() async throws {
+    func platformConnects(_ mock: MockReceiver) -> [InboundMessage] {
+        mock.sentMessages(ofType: "CONNECT").filter { $0.destinationID == CastEndpoint.platformReceiver }
+    }
+
+    func makeQuietClient(_ mock: MockReceiver) -> CastClient {
+        makeClient(mock) {
+            $0.heartbeatInterval = .seconds(600)
+            $0.heartbeatTimeout = .seconds(1200)
+        }
+    }
+
+    @Test func receiverCloseIsAnsweredWithAFreshConnect() async throws {
         let mock = MockReceiver()
-        let client = makeClient(mock)
+        let client = makeQuietClient(mock)
         try await client.connect()
+        mock.push(["type": "CLOSE"], namespace: .connection)
+        try await eventually { platformConnects(mock).count == 2 }
+        #expect(platformConnects(mock).last?.json?["connType"] == 0)
+        #expect(await client.state == .connected)
+
+        mock.push(["type": "CONNECTED", "protocolVersion": 0], namespace: .connection)
+        try await eventually { await client.negotiatedProtocolVersion(for: CastEndpoint.platformReceiver) == 0 }
+        #expect(await client.isConnected(to: CastEndpoint.platformReceiver))
+
+        mock.push(Fixtures.receiverStatus(level: 0.25), namespace: .receiver)
+        try await eventually { await client.receiverStatus?.volume?.level == 0.25 }
+        #expect(await client.state == .connected)
+    }
+
+    @Test func secondReceiverCloseWithNothingInBetweenTearsDown() async throws {
+        let mock = MockReceiver()
+        let client = makeQuietClient(mock)
+        try await client.connect()
+        mock.push(["type": "CLOSE"], namespace: .connection)
+        try await eventually { platformConnects(mock).count == 2 }
         mock.push(["type": "CLOSE"], namespace: .connection)
         try await eventually { await client.state != .connected }
         #expect(await client.state == .closed(.closedByReceiver))
+        #expect(platformConnects(mock).count == 2)
+    }
+
+    @Test func receiverCloseAfterTheDeviceSpokeAgainReconnectsAgain() async throws {
+        let mock = MockReceiver()
+        let client = makeQuietClient(mock)
+        try await client.connect()
+        mock.push(["type": "CLOSE"], namespace: .connection)
+        try await eventually { platformConnects(mock).count == 2 }
+        mock.push(["type": "CONNECTED", "protocolVersion": 0], namespace: .connection)
+        mock.push(["type": "CLOSE"], namespace: .connection)
+        try await eventually { platformConnects(mock).count == 3 }
+        #expect(await client.state == .connected)
+        #expect(await client.isConnected(to: CastEndpoint.platformReceiver))
     }
 
     @Test func applicationCloseOnlyDropsThatConnection() async throws {
@@ -395,7 +440,10 @@ struct ClientTests {
         try await client.openVirtualConnection(to: Fixtures.transportID)
         mock.push(["type": "CLOSE"], namespace: .connection, from: Fixtures.transportID)
         try await eventually { await !client.isConnected(to: Fixtures.transportID) }
+        mock.push(Fixtures.receiverStatus(level: 0.25), namespace: .receiver)
+        try await eventually { await client.receiverStatus?.volume?.level == 0.25 }
         #expect(await client.state == .connected)
+        #expect(platformConnects(mock).count == 1)
     }
 
     @Test func defaultSenderIDIsUniquePerClient() {
