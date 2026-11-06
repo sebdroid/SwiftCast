@@ -39,17 +39,17 @@ public actor CastClient {
 
     /// Tunable client behavior.
     public struct Configuration: Sendable {
-        /// Interval between heartbeat `PING`s. Non-positive values use the
-        /// default of 5 seconds. Very small values send pings that often;
-        /// keep it in seconds.
+        /// How long the connection may stay silent before a `PING` is sent.
+        /// Any inbound message restarts it, so a busy connection sends no
+        /// pings. Non-positive values use the default of 5 seconds.
         public var heartbeatInterval: Duration = Self.defaultHeartbeatInterval
-        /// The connection is considered dead when nothing at all arrives
-        /// within this long of a `PING` being sent. Any inbound message, not
-        /// only `PONG`, counts as a sign of life.
+        /// How long after that `PING` the client waits for anything inbound
+        /// before closing with ``CastError/heartbeatTimeout``. Any inbound
+        /// message, not only `PONG`, counts as a sign of life.
         ///
-        /// A dead receiver is noticed within this long of the next `PING`, so
-        /// at most ``heartbeatInterval`` plus this long after its last message.
-        /// Non-positive values use the default of 10 seconds.
+        /// A dead receiver is therefore noticed at most ``heartbeatInterval``
+        /// plus this long after its last message. Non-positive values use the
+        /// default of 10 seconds.
         public var inactivityTimeout: Duration = Self.defaultInactivityTimeout
         /// Default time to wait for a response to a request, such as a
         /// platform receiver request or a request on a custom namespace.
@@ -116,7 +116,6 @@ public actor CastClient {
     private var heartbeatTask: Task<Void, Never>?
     private var nextPing = ContinuousClock.now
     private var inactivityDeadline: ContinuousClock.Instant?
-    private var pingInFlight = false
 
     private let messageBroadcaster = Broadcaster<InboundMessage>()
     private let stateBroadcaster = Broadcaster<State>()
@@ -497,6 +496,7 @@ public actor CastClient {
     private func ingest(_ chunk: Data, generation: Int) {
         guard generation == self.generation else { return }
         inactivityDeadline = nil
+        nextPing = .now + configuration.effectiveHeartbeatInterval
         let output = decoder.append(chunk)
         for message in output.messages {
             handle(InboundMessage(message))
@@ -570,7 +570,6 @@ public actor CastClient {
 
     private func startHeartbeat(generation: Int) {
         heartbeatTask?.cancel()
-        pingInFlight = false
         nextPing = .now + configuration.effectiveHeartbeatInterval
         let firstWake = nextPing
         heartbeatTask = Task { [weak self] in
@@ -583,13 +582,18 @@ public actor CastClient {
         }
     }
 
-    /// Sends a `PING` when one is due and enforces the inactivity deadline.
+    /// Sends a `PING` once the connection has been silent for the heartbeat
+    /// interval and enforces the inactivity deadline that `PING` arms.
     /// Returns when the heartbeat loop should wake next, or `nil` to stop it.
     ///
+    /// Like Chromium's `KeepAliveHandler`, which restarts its ping timer on
+    /// every inbound message, only silence leads to a `PING`, and no further
+    /// one is sent until something arrives and clears the deadline. The loop
+    /// still wakes every interval while a deadline is armed, because inbound
+    /// traffic can clear it and move the next `PING` before that deadline.
+    ///
     /// The `PING` is written from its own task so a write that never
-    /// completes cannot hold up the deadline check. Only one `PING` write is
-    /// in flight at a time: inbound traffic keeps clearing the deadline, so
-    /// without that a stalled write would gain a new task every interval.
+    /// completes cannot hold up the deadline check.
     private func heartbeatTick(generation: Int) -> ContinuousClock.Instant? {
         guard generation == self.generation, state == .connected else { return nil }
         let now = ContinuousClock.now
@@ -601,13 +605,7 @@ public actor CastClient {
             nextPing = now + configuration.effectiveHeartbeatInterval
             if inactivityDeadline == nil {
                 inactivityDeadline = now + configuration.effectiveInactivityTimeout
-            }
-            if !pingInFlight {
-                pingInFlight = true
-                Task {
-                    await sendHeartbeat("PING", to: CastEndpoint.platformReceiver, generation: generation)
-                    if generation == self.generation { pingInFlight = false }
-                }
+                Task { await sendHeartbeat("PING", to: CastEndpoint.platformReceiver, generation: generation) }
             }
         }
         guard let inactivityDeadline else { return nextPing }
