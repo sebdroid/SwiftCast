@@ -79,6 +79,9 @@ public actor CastClient {
     private var nextRequestID = 1
     private var connectedDestinations: Set<String> = []
     private var protocolVersions: [String: Int] = [:]
+    /// Set while a `CONNECT` sent in answer to a `CLOSE` from the platform receiver has not been
+    /// followed by anything else from it. A second `CLOSE` in that window means the device refuses us.
+    private var platformReconnectPending = false
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var lastInbound = ContinuousClock.now
@@ -133,6 +136,7 @@ public actor CastClient {
         decoder = FrameDecoder()
         connectedDestinations = []
         protocolVersions = [:]
+        platformReconnectPending = false
 
         let transport = makeTransport()
         self.transport = transport
@@ -472,6 +476,10 @@ public actor CastClient {
     }
 
     private func handle(_ message: InboundMessage) {
+        let isClose = message.namespace == .connection && message.type == "CLOSE"
+        if message.sourceID == CastEndpoint.platformReceiver, !isClose {
+            platformReconnectPending = false
+        }
         switch message.namespace {
         case .heartbeat:
             if message.type == "PING" {
@@ -488,9 +496,13 @@ public actor CastClient {
                 connectedDestinations.remove(message.sourceID)
                 protocolVersions[message.sourceID] = nil
                 if message.sourceID == CastEndpoint.platformReceiver {
-                    messageBroadcaster.yield(message)
-                    teardown(error: .closedByReceiver, generation: generation)
-                    return
+                    guard !platformReconnectPending else {
+                        messageBroadcaster.yield(message)
+                        teardown(error: .closedByReceiver, generation: generation)
+                        return
+                    }
+                    platformReconnectPending = true
+                    reopenPlatformConnection(generation: generation)
                 }
             default:
                 break
@@ -507,6 +519,20 @@ public actor CastClient {
             resolve(requestID, with: .success(message))
         }
         messageBroadcaster.yield(message)
+    }
+
+    /// Chromium's cast message handler answers a `CLOSE` from the receiver by forgetting that
+    /// virtual connection and sending a fresh `CONNECT` with its next message, keeping the socket.
+    /// The `CONNECT` goes out straight away here so the platform receiver keeps talking to us.
+    private func reopenPlatformConnection(generation: Int) {
+        Task {
+            guard generation == self.generation else { return }
+            do {
+                try await openVirtualConnection(to: CastEndpoint.platformReceiver)
+            } catch {
+                teardown(error: (error as? CastError) ?? .connectionFailed(error.localizedDescription), generation: generation)
+            }
+        }
     }
 
     private func startHeartbeat(generation: Int) {
@@ -544,6 +570,7 @@ public actor CastClient {
         transport = nil
         connectedDestinations = []
         protocolVersions = [:]
+        platformReconnectPending = false
         let failures = pending
         pending = [:]
         for request in failures.values {

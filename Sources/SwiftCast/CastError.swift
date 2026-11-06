@@ -6,7 +6,7 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
     case notConnected
     /// The underlying transport failed.
     case connectionFailed(String)
-    /// The Cast device closed the platform connection.
+    /// The Cast device closed the platform connection again right after the client re-opened it.
     case closedByReceiver
     /// The receiver stopped responding to heartbeats.
     case heartbeatTimeout
@@ -43,7 +43,7 @@ public enum CastError: Error, Sendable, Equatable, LocalizedError {
         switch self {
         case .notConnected: "Not connected to the Cast device."
         case .connectionFailed(let message): "Connection failed: \(message.displaySanitized)"
-        case .closedByReceiver: "The Cast device closed the connection."
+        case .closedByReceiver: "The Cast device refused the connection."
         case .heartbeatTimeout: "The Cast device stopped responding."
         case .timeout: "The Cast device did not respond in time."
         case .malformedMessage(let message): "Malformed message: \(message.displaySanitized)"
