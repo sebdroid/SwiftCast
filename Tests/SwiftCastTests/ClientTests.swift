@@ -276,6 +276,27 @@ struct ClientTests {
         #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == nil)
     }
 
+    @Test func failedApplicationConnectIsRolledBack() async throws {
+        let mock = MockReceiver()
+        mock.on("CONNECT") { request, mock in
+            guard request.destinationID == Fixtures.transportID else { return }
+            mock.push(["type": "CONNECTED", "protocolVersion": 1], namespace: .connection, from: request.destinationID, to: request.sourceID)
+        }
+        let client = makeClient(mock)
+        try await client.connect()
+        mock.failNextSend(ofType: "CONNECT", with: .connectionFailed("write failed"))
+        await #expect(throws: CastError.self) { try await client.openVirtualConnection(to: Fixtures.transportID) }
+
+        mock.push(Fixtures.receiverStatus(level: 0.3), namespace: .receiver, to: "*")
+        try await eventually { await client.receiverStatus?.volume?.level == 0.3 }
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+        #expect(await client.negotiatedProtocolVersion(for: Fixtures.transportID) == nil)
+
+        try await client.openVirtualConnection(to: Fixtures.transportID)
+        #expect(await client.isConnected(to: Fixtures.transportID))
+        #expect(mock.sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 2)
+    }
+
     @Test func connectDoesNotWaitForConnected() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
