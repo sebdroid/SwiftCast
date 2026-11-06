@@ -129,6 +129,12 @@ public final class CastSession {
     // MARK: - Playback
 
     /// Loads media, launching ``appID`` on the receiver if necessary.
+    ///
+    /// A launch of the same app already pending on the client is joined
+    /// instead of sent again, and it is cancelled only when every caller
+    /// waiting on it has been cancelled. Its `LAUNCH_STATUS` updates still
+    /// reach the `onStatus` of any ``ReceiverController/launch(_:timeout:onStatus:)``
+    /// call waiting on it; this call has none of its own.
     @discardableResult
     public func load(
         _ media: MediaInformation,
@@ -144,6 +150,12 @@ public final class CastSession {
     }
 
     /// Loads a queue, launching ``appID`` on the receiver if necessary.
+    ///
+    /// A launch of the same app already pending on the client is joined
+    /// instead of sent again, and it is cancelled only when every caller
+    /// waiting on it has been cancelled. Its `LAUNCH_STATUS` updates still
+    /// reach the `onStatus` of any ``ReceiverController/launch(_:timeout:onStatus:)``
+    /// call waiting on it; this call has none of its own.
     @discardableResult
     public func loadQueue(_ items: [QueueItem], startIndex: Int = 0, repeatMode: RepeatMode = .off) async throws -> MediaStatus {
         let controller = try await ensureMediaController()

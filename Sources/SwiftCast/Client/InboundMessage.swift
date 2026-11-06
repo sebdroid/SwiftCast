@@ -25,10 +25,11 @@ public struct InboundMessage: Sendable, Hashable {
 
     /// The `requestId` the message responds to; `0` or `nil` for unsolicited messages.
     /// Only 32-bit integers are accepted.
-    public var requestID: Int? {
-        guard let number = json?["requestId"]?.doubleValue, let id = Int32(exactly: number) else { return nil }
-        return Int(id)
-    }
+    public var requestID: Int? { int32Field("requestId") }
+
+    /// The `launchRequestId` some receivers use instead of `requestId` to
+    /// echo the id of a `LAUNCH` request. Only 32-bit integers are accepted.
+    public var launchRequestID: Int? { int32Field("launchRequestId") }
 
     /// Decodes the payload as `T`.
     public func decode<T: Decodable>(_ type: T.Type = T.self) throws -> T {
@@ -36,5 +37,10 @@ public struct InboundMessage: Sendable, Hashable {
             throw CastError.unexpectedResponse("Message has no string payload")
         }
         return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    private func int32Field(_ key: String) -> Int? {
+        guard let number = json?[key]?.doubleValue, let id = Int32(exactly: number) else { return nil }
+        return Int(id)
     }
 }
