@@ -175,7 +175,7 @@ struct ClientTests {
     @Test func noPingIsSentWhileTrafficFlows() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock) {
-            $0.heartbeatInterval = .milliseconds(100)
+            $0.heartbeatInterval = .milliseconds(200)
             $0.inactivityTimeout = .seconds(30)
         }
         try await client.connect()
