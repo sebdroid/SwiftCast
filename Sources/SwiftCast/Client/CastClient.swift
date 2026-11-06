@@ -31,25 +31,26 @@ public actor CastClient {
     public enum ConnectionType: Int, Sendable {
         /// A regular sender connection, visible to the application as a connected sender.
         case strong = 0
-        /// A connection the application is not told about as a connected sender.
-        /// Receiver applications can only broadcast over an invisible connection, so replies
-        /// addressed to this sender may never arrive. Use it to listen, not for `MediaController`.
+        /// The application is not told about this sender and cannot address its own custom
+        /// messages to it, since receiver applications can only broadcast over an invisible
+        /// connection. Namespaces the receiver platform answers itself still reply; Chromium opens
+        /// every application connection this way and drives media over it.
         case invisible = 2
     }
 
     /// Tunable client behavior.
     public struct Configuration: Sendable {
-        /// Interval between heartbeat `PING`s. Non-positive values use the
-        /// default of 5 seconds. Very small values send pings that often;
-        /// keep it in seconds.
+        /// How long the connection may stay silent before a `PING` is sent.
+        /// Any inbound message restarts it, so a busy connection sends no
+        /// pings. Non-positive values use the default of 5 seconds.
         public var heartbeatInterval: Duration = Self.defaultHeartbeatInterval
-        /// The connection is considered dead when nothing at all arrives
-        /// within this long of a `PING` being sent. Any inbound message, not
-        /// only `PONG`, counts as a sign of life.
+        /// How long after that `PING` the client waits for anything inbound
+        /// before closing with ``CastError/heartbeatTimeout``. Any inbound
+        /// message, not only `PONG`, counts as a sign of life.
         ///
-        /// A dead receiver is noticed within this long of the next `PING`, so
-        /// at most ``heartbeatInterval`` plus this long after its last message.
-        /// Non-positive values use the default of 10 seconds.
+        /// A dead receiver is therefore noticed at most ``heartbeatInterval``
+        /// plus this long after its last message. Non-positive values use the
+        /// default of 10 seconds.
         public var inactivityTimeout: Duration = Self.defaultInactivityTimeout
         /// Default time to wait for a response to a request, such as a
         /// platform receiver request or a request on a custom namespace.
@@ -126,11 +127,13 @@ public actor CastClient {
     private(set) var closesAwaitingOpen = 0
     private var onConnectWriteStart: (@Sendable () async -> Void)?
     private var protocolVersions: [String: Int] = [:]
+    /// Set while a `CONNECT` sent in answer to a `CLOSE` from the platform receiver has not been
+    /// followed by anything else from it. A second `CLOSE` in that window means the device refuses us.
+    private var platformReconnectPending = false
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var nextPing = ContinuousClock.now
     private var inactivityDeadline: ContinuousClock.Instant?
-    private var pingInFlight = false
 
     private let messageBroadcaster = Broadcaster<InboundMessage>()
     private let stateBroadcaster = Broadcaster<State>()
@@ -183,6 +186,7 @@ public actor CastClient {
         connectedDestinations = []
         connectsInFlight = [:]
         protocolVersions = [:]
+        platformReconnectPending = false
 
         let transport = makeTransport()
         self.transport = transport
@@ -625,6 +629,7 @@ public actor CastClient {
     private func ingest(_ chunk: Data, generation: Int) {
         guard generation == self.generation else { return }
         inactivityDeadline = nil
+        nextPing = .now + configuration.effectiveHeartbeatInterval
         let output = decoder.append(chunk)
         for message in output.messages {
             handle(InboundMessage(message))
@@ -637,6 +642,10 @@ public actor CastClient {
 
     private func handle(_ message: InboundMessage) {
         guard accepts(message) else { return }
+        let isClose = message.namespace == .connection && message.type == "CLOSE"
+        if message.sourceID == CastEndpoint.platformReceiver, !isClose {
+            platformReconnectPending = false
+        }
         switch message.namespace {
         case .heartbeat:
             if message.type == "PING" {
@@ -654,9 +663,13 @@ public actor CastClient {
                 connectedDestinations.remove(message.sourceID)
                 protocolVersions[message.sourceID] = nil
                 if message.sourceID == CastEndpoint.platformReceiver {
-                    messageBroadcaster.yield(message)
-                    teardown(error: .closedByReceiver, generation: generation)
-                    return
+                    guard !platformReconnectPending else {
+                        messageBroadcaster.yield(message)
+                        teardown(error: .closedByReceiver, generation: generation)
+                        return
+                    }
+                    platformReconnectPending = true
+                    reopenPlatformConnection(generation: generation)
                 }
             default:
                 break
@@ -701,9 +714,22 @@ public actor CastClient {
         return true
     }
 
+    /// Chromium's cast message handler answers a `CLOSE` from the receiver by forgetting that
+    /// virtual connection and sending a fresh `CONNECT` with its next message, keeping the socket.
+    /// The `CONNECT` goes out straight away here so the platform receiver keeps talking to us.
+    private func reopenPlatformConnection(generation: Int) {
+        Task {
+            guard generation == self.generation else { return }
+            do {
+                try await openVirtualConnection(to: CastEndpoint.platformReceiver)
+            } catch {
+                teardown(error: (error as? CastError) ?? .connectionFailed(error.localizedDescription), generation: generation)
+            }
+        }
+    }
+
     private func startHeartbeat(generation: Int) {
         heartbeatTask?.cancel()
-        pingInFlight = false
         nextPing = .now + configuration.effectiveHeartbeatInterval
         let firstWake = nextPing
         heartbeatTask = Task { [weak self] in
@@ -716,13 +742,18 @@ public actor CastClient {
         }
     }
 
-    /// Sends a `PING` when one is due and enforces the inactivity deadline.
+    /// Sends a `PING` once the connection has been silent for the heartbeat
+    /// interval and enforces the inactivity deadline that `PING` arms.
     /// Returns when the heartbeat loop should wake next, or `nil` to stop it.
     ///
+    /// Like Chromium's `KeepAliveHandler`, which restarts its ping timer on
+    /// every inbound message, only silence leads to a `PING`, and no further
+    /// one is sent until something arrives and clears the deadline. The loop
+    /// still wakes every interval while a deadline is armed, because inbound
+    /// traffic can clear it and move the next `PING` before that deadline.
+    ///
     /// The `PING` is written from its own task so a write that never
-    /// completes cannot hold up the deadline check. Only one `PING` write is
-    /// in flight at a time: inbound traffic keeps clearing the deadline, so
-    /// without that a stalled write would gain a new task every interval.
+    /// completes cannot hold up the deadline check.
     private func heartbeatTick(generation: Int) -> ContinuousClock.Instant? {
         guard generation == self.generation, state == .connected else { return nil }
         let now = ContinuousClock.now
@@ -734,13 +765,7 @@ public actor CastClient {
             nextPing = now + configuration.effectiveHeartbeatInterval
             if inactivityDeadline == nil {
                 inactivityDeadline = now + configuration.effectiveInactivityTimeout
-            }
-            if !pingInFlight {
-                pingInFlight = true
-                Task {
-                    await sendHeartbeat("PING", to: CastEndpoint.platformReceiver, generation: generation)
-                    if generation == self.generation { pingInFlight = false }
-                }
+                Task { await sendHeartbeat("PING", to: CastEndpoint.platformReceiver, generation: generation) }
             }
         }
         guard let inactivityDeadline else { return nextPing }
@@ -774,6 +799,7 @@ public actor CastClient {
         connectedDestinations = []
         connectsInFlight = [:]
         protocolVersions = [:]
+        platformReconnectPending = false
         let failures = pending
         pending = [:]
         for request in failures.values {
