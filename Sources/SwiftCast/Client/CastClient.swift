@@ -124,6 +124,7 @@ public actor CastClient {
     private var connectsInFlight: [String: OpenInFlight] = [:]
     private var virtualConnectionIntents: [String: Int] = [:]
     private(set) var closesAwaitingOpen = 0
+    private var onConnectWriteStart: (@Sendable () async -> Void)?
     private var protocolVersions: [String: Int] = [:]
     private var receiveTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
@@ -353,8 +354,10 @@ public actor CastClient {
     /// open or close has been issued (a close cancelled while it waited on the
     /// same open does not count). If the `CONNECT` write fails, the
     /// call that issued it and every call waiting on it throw that write's
-    /// error. If the write succeeds but the client was torn down while it
-    /// was in flight, they all throw ``CastError/notConnected`` instead.
+    /// error. If the client was torn down before the write started, nothing
+    /// is written and they all throw ``CastError/notConnected``. If the write
+    /// succeeds but the client was torn down while it was in flight, they all
+    /// throw ``CastError/notConnected`` instead.
     public func openVirtualConnection(to destination: String) async throws {
         let intent = recordIntent(for: destination)
         let generation = generation
@@ -380,6 +383,8 @@ public actor CastClient {
         let write = Task {
             let result: Result<Void, any Error>
             do {
+                if let onConnectWriteStart { await onConnectWriteStart() }
+                guard self.generation == generation else { throw CastError.notConnected }
                 try await sendJSON(payload, namespace: .connection, to: destination)
                 result = .success(())
             } catch {
@@ -451,6 +456,12 @@ public actor CastClient {
     /// How many closes are suspended on the in-flight open of `destination`.
     func closesWaitingOnOpen(to destination: String) -> Int {
         connectsInFlight[destination]?.completion.waiterCount ?? 0
+    }
+
+    /// Installs a hook an open's write task awaits just before it checks the
+    /// connection and writes `CONNECT`.
+    func setOnConnectWriteStart(_ hook: (@Sendable () async -> Void)?) {
+        onConnectWriteStart = hook
     }
 
     /// Whether an open of `destination` has its `CONNECT` write in flight.

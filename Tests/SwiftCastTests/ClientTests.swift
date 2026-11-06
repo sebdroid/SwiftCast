@@ -1301,6 +1301,29 @@ struct ClientTests {
         #expect(mocks[1].sentMessages(ofType: "CONNECT").filter { $0.destinationID == Fixtures.transportID }.count == 1)
     }
 
+    @Test func staleOpenerDoesNotWriteOnTheReconnectedTransport() async throws {
+        let mocks = [MockReceiver(), MockReceiver()]
+        let index = Counter()
+        let client = CastClient { mocks[min(index.increment(), mocks.count) - 1] }
+        try await client.connect()
+        let gate = OneShotGate()
+        await client.setOnConnectWriteStart { await gate.pass() }
+        let staleOpen = Task { try await client.openVirtualConnection(to: Fixtures.transportID) }
+        try await eventually { gate.isHolding }
+        #expect(await client.isOpening(Fixtures.transportID))
+
+        mocks[0].drop(with: CastError.connectionFailed("wifi blip"))
+        try await eventually { await client.state != .connected }
+        try await client.connect()
+
+        gate.open()
+        await #expect(throws: CastError.notConnected) { try await settled(staleOpen) }
+        #expect(mocks[1].sentMessages(ofType: "CONNECT").map(\.destinationID) == ["receiver-0"])
+        #expect(await !client.isConnected(to: Fixtures.transportID))
+        #expect(await !client.isOpening(Fixtures.transportID))
+        #expect(await client.state == .connected)
+    }
+
     @Test func destinationIsConnectedBeforeTheConnectWriteCompletes() async throws {
         let mock = MockReceiver()
         let client = makeClient(mock)
@@ -1460,6 +1483,39 @@ final class SettledResult<T: Sendable>: @unchecked Sendable {
     func store(_ result: Result<T, any Error>) {
         lock.lock(); defer { lock.unlock() }
         stored = result
+    }
+}
+
+/// Suspends the first caller of ``pass()`` until ``open()`` is called. Every
+/// other caller passes straight through.
+final class OneShotGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var used = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    var isHolding: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return waiter != nil
+    }
+    func pass() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            guard !used else {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            used = true
+            waiter = continuation
+            lock.unlock()
+        }
+    }
+    func open() {
+        lock.lock()
+        used = true
+        let held = waiter
+        waiter = nil
+        lock.unlock()
+        held?.resume()
     }
 }
 
