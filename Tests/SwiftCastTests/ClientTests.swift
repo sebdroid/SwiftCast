@@ -177,12 +177,12 @@ struct ClientTests {
 
     @Test func stalledPingWriteDoesNotStackUp() async throws {
         let mock = MockReceiver()
+        mock.holdSends(ofType: "PING")
         let client = makeClient(mock) {
             $0.heartbeatInterval = .milliseconds(50)
             $0.inactivityTimeout = .seconds(30)
         }
         try await client.connect()
-        mock.holdSends(ofType: "PING")
         for step in 1...20 {
             mock.push(Fixtures.receiverStatus(level: Double(step) / 100), namespace: .receiver, to: "*")
             try await Task.sleep(for: .milliseconds(20))
