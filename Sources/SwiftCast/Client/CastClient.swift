@@ -31,6 +31,8 @@ public actor CastClient {
         /// A regular sender connection, visible to the application as a connected sender.
         case strong = 0
         /// A connection the application is not told about as a connected sender.
+        /// Receiver applications can only broadcast over an invisible connection, so replies
+        /// addressed to this sender may never arrive. Use it to listen, not for `MediaController`.
         case invisible = 2
     }
 
