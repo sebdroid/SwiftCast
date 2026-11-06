@@ -73,11 +73,10 @@ public final class CastSession {
 
     /// The receiver application used for media (Default Media Receiver by default).
     public var appID: CastAppID
-    /// Whether to reconnect automatically when the connection is lost, including when the
-    /// device closes it (`CastError.closedByReceiver`). Chromium keeps talking to a device
-    /// after a CLOSE from the receiver by sending a fresh CONNECT with its next message, and
-    /// the session does the same by reconnecting. OpenCastSwift ignores the CLOSE and keeps
-    /// using its channel, so it never drops in the first place. Set it to false and handle
+    /// Whether to reconnect automatically when the connection is lost. A device that closes
+    /// the platform connection is answered by the client with a fresh CONNECT, as Chromium
+    /// does, so only a dropped socket, a heartbeat timeout or a device that keeps refusing
+    /// (`CastError.closedByReceiver`) reaches this setting. Set it to false and handle
     /// `.failed(device, error)` to stay down instead.
     public var reconnectsAutomatically = true
     /// Spacing and time limit of automatic reconnection attempts.
