@@ -175,6 +175,27 @@ struct ClientTests {
         #expect(mock.sentMessages(ofType: "PING").count >= 1)
     }
 
+    @Test func stalledPingWriteDoesNotStackUp() async throws {
+        let mock = MockReceiver()
+        let client = makeClient(mock) {
+            $0.heartbeatInterval = .milliseconds(50)
+            $0.inactivityTimeout = .seconds(30)
+        }
+        try await client.connect()
+        mock.holdSends(ofType: "PING")
+        for step in 1...20 {
+            mock.push(Fixtures.receiverStatus(level: Double(step) / 100), namespace: .receiver, to: "*")
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(mock.heldSendCount == 1)
+        #expect(mock.sentMessages(ofType: "PING").count == 1)
+        #expect(await client.state == .connected)
+
+        mock.releaseHeldSends()
+        try await eventually { mock.sentMessages(ofType: "PING").count >= 3 }
+        #expect(await client.state == .connected)
+    }
+
     @Test func anyInboundTrafficKeepsConnectionAlive() async throws {
         let mock = MockReceiver()
         mock.answersPings = false
